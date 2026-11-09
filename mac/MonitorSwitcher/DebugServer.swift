@@ -118,6 +118,17 @@ final class DebugServer {
             return "burst \(count) gap=\(gap)us"
         }
 
+        // inject <dx> <dy>：本机直接注入一次相对位移并回报光标位置，
+        // 用来验证虚拟坐标在屏幕边缘不会漂移（无需 Windows 参与）。
+        if text.hasPrefix("inject ") {
+            let p = text.split(separator: " ").map(String.init)
+            let dx = p.count > 1 ? (Int(p[1]) ?? 0) : 0
+            let dy = p.count > 2 ? (Int(p[2]) ?? 0) : 0
+            Injector.mouseMove(dx: dx, dy: dy)
+            let pos = CGEvent(source: nil)?.location ?? .zero
+            return String(format: "cursor=(%.0f,%.0f)", pos.x, pos.y)
+        }
+
         // menu：输出菜单结构，便于自动化验证布局（无需截图）
         if text == "menu" {
             let app = NSApplication.shared.delegate as? AppDelegate

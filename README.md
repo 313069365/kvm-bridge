@@ -2,7 +2,9 @@
 
 让一台显示器和一套键鼠在 **macOS** 与 **Windows** 两台主机之间共用。两端程序完全对等，任意一端都能切换屏幕、切换键鼠模式。
 
-当前版本：**0.5.2**
+当前版本：**0.5.3**
+
+0.5.3 修复：切回 Mac 时不再无条件重配显示模式（该操作会短暂中断视频输出，造成「无信号」闪烁）；两端静止时不再轮询 DDC，避免占用显示器 I2C；Windows 端声明 DPI 感知并拦截光标回中产生的伪位移（光标乱跳）；Mac 端把注入坐标夹在屏幕边界内，避免贴边后内部坐标漂移。
 
 ---
 
@@ -30,9 +32,9 @@
 
 | 文件 | 平台 | 说明 |
 |---|---|---|
-| `KVMBridge-0.5.2-mac.dmg` | macOS（Apple Silicon） | 拖入「应用程序」 |
-| `KVMBridge-0.5.2-mac.zip` | macOS（Apple Silicon） | 同上，zip 版 |
-| `KVMBridge-0.5.2-win.zip` | Windows 10 / 11 | 解压后直接运行 `KVMBridge.exe` |
+| `KVMBridge-0.5.3-mac.dmg` | macOS（Apple Silicon） | 拖入「应用程序」 |
+| `KVMBridge-0.5.3-mac.zip` | macOS（Apple Silicon） | 同上，zip 版 |
+| `KVMBridge-0.5.3-win.zip` | Windows 10 / 11 | 解压后直接运行 `KVMBridge.exe` |
 
 ### macOS 端
 1. 把 `KVMBridge.app` 拖进「应用程序」并运行，菜单栏出现图标。
@@ -95,7 +97,7 @@ windows/package/       Windows 端 C# 源码
                        （托盘、DDC、协议、钩子、自动发现、计划任务自启）
 vendor/m1ddc/          DDC/CI 命令行工具（源码 + 预编译 arm64 二进制）
 scripts/pack.sh        双端安装包打包脚本
-dist/                 0.5.2 可运行安装包
+dist/                 0.5.3 可运行安装包
 DESIGN.md             系统设计
 UI-SPEC.md            界面规格
 ```
@@ -119,7 +121,7 @@ UI-SPEC.md            界面规格
 ## 校验和（SHA-256）
 
 ```
-7fe43fef7dc45d9d4da41a964c0f1c8221605441ec2ac8395e6e5f08de4ec2b1  KVMBridge-0.5.2-mac.dmg
-543e07e95821044c9eeacb7f0ee1fd00dfa85c62e9836e3dbda09c6458bb6bd3  KVMBridge-0.5.2-mac.zip
-bb66f381df7e526ec63c42ef88976a71b125fe0c1ca4be5e02d753d25d3a1535  KVMBridge-0.5.2-win.zip
+14804c1e2482c1e9ad35d24877013fed5d40d67f4f6b60360e4fc3028ee1566e  KVMBridge-0.5.3-mac.dmg
+89b797f215c25cbe1d9666a62d0b5cdc69454e0422e79ed6021004f730aa0cb5  KVMBridge-0.5.3-mac.zip
+c958aa55fbf244ae066191ab2b91d55d1ae967367dc0006fb6b6a736cb2a0246  KVMBridge-0.5.3-win.zip
 ```

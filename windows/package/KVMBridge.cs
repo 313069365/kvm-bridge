@@ -230,7 +230,7 @@ namespace KvmBridge
 
         private static void Release(List<PHYSICAL_MONITOR> list)
         {
-            if (list.Count == 0) return;
+            if (list == null || list.Count == 0) return;
             try
             {
                 PHYSICAL_MONITOR[] arr = list.ToArray();
@@ -241,40 +241,66 @@ namespace KvmBridge
             }
         }
 
+        // 显示器句柄缓存。GetPhysicalMonitorsFromHMONITOR / DestroyPhysicalMonitors
+        // 是一次完整的显示器枚举，在非活动输入口上做会扰动 DDC/HPD：
+        // 空闲轮询每 1.5 秒一遍，屏幕切走后就会让显示器反复重扫输入，
+        // 表现为「无信号」与画面闪烁。改成复用句柄，只在必要时重建。
+        private static List<PHYSICAL_MONITOR> _handles;
+        private static DateTime _handlesAt = DateTime.MinValue;
+
+        private static List<PHYSICAL_MONITOR> Monitors(bool refresh)
+        {
+            lock (_gate)
+            {
+                if (!refresh && _handles != null && _handles.Count > 0
+                    && (DateTime.UtcNow - _handlesAt).TotalSeconds < 60)
+                    return _handles;
+                Release(_handles);
+                _handles = Collect();       // Collect 内部同样 lock(_gate)，Monitor 可重入
+                _handlesAt = DateTime.UtcNow;
+                return _handles;
+            }
+        }
+
+        private static int _readFails;
+
         public static int GetInput()
         {
-            List<PHYSICAL_MONITOR> mons = Collect();
-            try
+            // 屏幕切走后本机是非活动输入口，本来就常读不到 DDC。
+            // 这时绝不能每轮都重建显示器句柄——反复枚举会扰动 HPD，
+            // 正是「无信号 + 闪烁」的来源。连续失败 3 次才重建一次。
+            List<PHYSICAL_MONITOR> mons = Monitors(false);
+            uint type;
+            uint cur;
+            uint max;
+            if (mons.Count > 0
+                && GetVCPFeatureAndVCPFeatureReply(mons[0].hPhysicalMonitor, 0x60,
+                        out type, out cur, out max)
+                && IsKnown((int)cur))
             {
-                if (mons.Count == 0) return -1;
-                uint type;
-                uint cur;
-                uint max;
-                if (GetVCPFeatureAndVCPFeatureReply(mons[0].hPhysicalMonitor, 0x60, out type, out cur, out max))
-                {
-                    if (IsKnown((int)cur)) return (int)cur;
-                }
-                return -1;
+                _readFails = 0;
+                return (int)cur;
             }
-            finally
+
+            if (++_readFails >= 3)
             {
-                Release(mons);
+                _readFails = 0;
+                mons = Monitors(true);
+                if (mons.Count > 0
+                    && GetVCPFeatureAndVCPFeatureReply(mons[0].hPhysicalMonitor, 0x60,
+                            out type, out cur, out max)
+                    && IsKnown((int)cur)) return (int)cur;
             }
+            return -1;
         }
 
         public static void SetInput(int value)
         {
-            List<PHYSICAL_MONITOR> mons = Collect();
-            try
+            // 写 DDC 只在切屏时发生，频率极低，重建一次句柄保证有效。
+            List<PHYSICAL_MONITOR> mons = Monitors(true);
+            for (int i = 0; i < mons.Count; i++)
             {
-                for (int i = 0; i < mons.Count; i++)
-                {
-                    SetVCPFeature(mons[i].hPhysicalMonitor, 0x60, (uint)value);
-                }
-            }
-            finally
-            {
-                Release(mons);
+                SetVCPFeature(mons[i].hPhysicalMonitor, 0x60, (uint)value);
             }
         }
     }
@@ -1150,6 +1176,8 @@ namespace KvmBridge
         /// 钩子收到的全部 WM_MOUSEMOVE（含系统/程序注入）与其中被标记为 injected 的数量
         public static int MouseAll;
         public static int MouseInjected;
+        /// 被判定为「坐标跳变」而丢弃的伪位移帧数，用于验证乱跳是否被挡住
+        public static int JumpsDropped;
         /// 自测模式：存在 %TEMP%\kvm-selftest.on 时，把注入事件也当作真实输入，
         /// 便于在没有物理鼠标的情况下自动跑通「截获→转发→注入」全链路。
         private static bool _allowInjected;
@@ -1365,6 +1393,18 @@ namespace KvmBridge
                         int dy = y - _lastY;
                         _lastX = x;
                         _lastY = y;
+
+                        // 光标回中、DPI 坐标切换、显示器重新枚举都会让相邻两帧
+                        // 坐标突然跳变。这是「伪位移」，不是用户真的甩了鼠标；
+                        // 转发出去就是对端光标瞬间飞走。真实鼠标一帧跨不过
+                        // 1/4 个屏幕，超过就只重置基准、丢弃这一帧。
+                        int limitX = Math.Max(200, _screenW / 4);
+                        int limitY = Math.Max(200, _screenH / 4);
+                        if (Math.Abs(dx) > limitX || Math.Abs(dy) > limitY)
+                        {
+                            JumpsDropped++;
+                            return (IntPtr)1;
+                        }
 
                         if (dx != 0 || dy != 0)
                         {
@@ -1688,7 +1728,8 @@ namespace KvmBridge
             while (DateTime.UtcNow < deadline)
             {
                 if (Ddc.GetInput() == MyValue) return true;
-                Thread.Sleep(300);
+                // 别把 I2C 打满：切屏期间高频 DDC 读会拖慢显示器同步
+                Thread.Sleep(500);
             }
             return false;
         }
@@ -1866,7 +1907,7 @@ namespace KvmBridge
         private const uint ES_SYSTEM_REQUIRED = 0x00000001;
         private const uint ES_DISPLAY_REQUIRED = 0x00000002;
 
-        private const string AppVersion = "0.5.2";
+        private const string AppVersion = "0.5.3";
 
         private static int[] Values { get { return Ddc.PortValues; } }
         private static string[] Names { get { return Ddc.PortNames; } }
@@ -2063,10 +2104,13 @@ namespace KvmBridge
             {
                 while (_running)
                 {
-                    int value = Ddc.GetInput();
-                    _cachedInput = value;
-                    UpdateCapture(value);
-                    Thread.Sleep(1500);
+                    // 后台绝不查询 DDC。VCP 0x60 事务会占用显示器的 I2C，
+                    // 在 USB-C/DP 链路上足以让画面瞬时失步，显示器就会
+                    // 间歇弹「无信号」。归属与截获只要状态变化就会主动
+                    // 调 UpdateCapture，这里只做零成本的兜底。
+                    // DDC 只在用户真正发起切屏时由 SwitchFlow 读写。
+                    UpdateCapture(_cachedInput);
+                    Thread.Sleep(5000);
                 }
             }));
             _poller.IsBackground = true;
@@ -2463,6 +2507,7 @@ namespace KvmBridge
                     + " inj=" + InputHook.MouseInjected
                     + " seen=" + InputHook.MouseSeen
                     + " moves=" + InputHook.MovesSent
+                    + " jumps=" + InputHook.JumpsDropped
                     + " sent=" + _sender.SentMoves
                     + " recv=" + _relay.Injected
                     + " drop=" + _relay.DroppedLocal

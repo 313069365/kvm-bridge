@@ -41,7 +41,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private(set) var peerMyValue: Int?
 
     private var displayKeeper: Process?
-    private var pollTimer: Timer?
     private var cachedInput: Int?
     private var polling = false
 
@@ -231,10 +230,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         refresh()
-
-        poll()
-        pollTimer = Timer.scheduledTimer(timeInterval: 2.0, target: self,
-                                         selector: #selector(pollTick), userInfo: nil, repeats: true)
+        // 不再定时轮询 DDC：菜单勾选只认协议归属，读数没有任何消费者，
+        // 而每 2 秒 fork 一次 m1ddc 会持续占用 I2C，切屏刚完成时
+        // 尤其容易打断显示器同步（表现为「无信号」和画面闪烁）。
+        // 需要读数时由 menuWillOpen 按需读一次。
     }
 
     // MARK: - 菜单
@@ -399,11 +398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh()
     }
 
-    // MARK: - 状态轮询
-
-    @objc private func pollTick() {
-        poll()
-    }
+    // MARK: - 状态读取（只在菜单打开时按需执行）
 
     /// 读 DDC 要 fork 子进程（150~300ms），不能在主线程做，否则菜单会卡
     private func poll() {

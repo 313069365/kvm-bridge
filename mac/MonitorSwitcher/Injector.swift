@@ -16,9 +16,19 @@ enum Injector {
     private static var pressedKeys: [UInt16: Bool] = [:]
 
     /// 自己维护光标位置：每个移动事件都去查一次系统光标会创建临时 CGEvent，
-    /// 高频下是可见的开销。空闲 300ms 后重新对齐，避免与真实位置漂移。
+    /// 高频下是可见的开销。以下三种情况必须重新对齐，否则远端鼠标会「跳回旧位置」：
+    /// ① 空闲 300ms 以上；② 本机刚有过真实鼠标输入；③ 缓存跑出了屏幕边界。
     private static var cursor: CGPoint?
     private static var lastMoveAt = Date.distantPast
+
+    /// 光标不能越出当前显示屏；虚拟坐标必须跟真实光标一起被夹住，
+    /// 否则贴边后内部坐标会继续累加，反向要甩很久才有反应（表现为鼠标卡死）。
+    private static func clamp(_ p: CGPoint) -> CGPoint {
+        let b = CGDisplayBounds(CGMainDisplayID())
+        guard b.width > 2, b.height > 2 else { return p }
+        return CGPoint(x: min(max(p.x, b.minX + 1), b.maxX - 2),
+                       y: min(max(p.y, b.minY + 1), b.maxY - 2))
+    }
 
     // MARK: - 键
 
@@ -60,13 +70,16 @@ enum Injector {
         guard dx != 0 || dy != 0 else { return }
 
         let now = Date()
-        if cursor == nil || now.timeIntervalSince(lastMoveAt) > 0.3 {
-            cursor = CGEvent(source: nil)?.location
+        // 本机用户碰了 Mac 上的真实鼠标后，缓存的虚拟坐标已经失效。
+        // 注入事件带 tag，不会更新 lastLocalMouse，所以这里不会自己触发自己。
+        let touchedLocally = EventTapMonitor.shared.lastLocalMouse > lastMoveAt
+        if cursor == nil || touchedLocally || now.timeIntervalSince(lastMoveAt) > 0.3 {
+            if let pos = CGEvent(source: nil)?.location { cursor = clamp(pos) }
         }
         lastMoveAt = now
 
         guard let base = cursor else { return }
-        let target = CGPoint(x: base.x + CGFloat(dx), y: base.y + CGFloat(dy))
+        let target = clamp(CGPoint(x: base.x + CGFloat(dx), y: base.y + CGFloat(dy)))
         cursor = target
         guard let event = CGEvent(mouseEventSource: source,
                                   mouseType: .mouseMoved,
@@ -77,8 +90,12 @@ enum Injector {
     }
 
     static func mouseButton(_ button: Int, down: Bool) {
-        let current = cursor ?? CGEvent(source: nil)?.location
-        guard let current = current else { return }
+        // 点击必须落在真实光标上：本机用户刚移动过鼠标就重新对齐，
+        // 否则会在旧位置误点。
+        if EventTapMonitor.shared.lastLocalMouse > lastMoveAt {
+            if let pos = CGEvent(source: nil)?.location { cursor = clamp(pos) }
+        }
+        guard let current = cursor ?? CGEvent(source: nil)?.location else { return }
         let type: CGEventType
         let cgButton: CGMouseButton
         if button == 2 {

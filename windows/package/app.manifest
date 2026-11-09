@@ -24,4 +24,17 @@
       <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
     </application>
   </compatibility>
+
+  <!--
+    必须声明 DPI 感知：4K 屏 + 显示缩放时，未声明的进程从
+    GetSystemMetrics 拿到的是缩放后的逻辑尺寸，而低级鼠标钩子报告的
+    是另一套坐标。屏幕中心 / 边缘边界算错后，光标回中会产生几百上千
+    像素的「伪位移」，转发到 Mac 就是光标乱跳。
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">permonitorv2,permonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
 </assembly>
