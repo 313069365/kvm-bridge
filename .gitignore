@@ -1,0 +1,31 @@
+# 本机专用的远程部署/测试脚本与 SSH 凭据一律不公开
+/.remote/
+.DS_Store
+
+# 开发期原型脚本（含本机绝对路径、内网地址），仅本机保留
+/mac/capability.py
+/mac/kvm_server.py
+/scripts/probe-roundtrip.sh
+/scripts/probe-switch.sh
+/scripts/watchdog.sh
+
+# 代码签名身份：本机生成、绝不公开
+# 仓库只保留 csr.cnf（模板）与 setup-signing.sh（生成脚本）
+/mac/signing/*.pem
+/mac/signing/*.p12
+/mac/signing/*.key
+
+# 构建中间产物
+/build/
+/mac/MonitorSwitcher/KVMBridge.app/
+/mac/MonitorSwitcher/AppIcon.iconset/
+/mac/MonitorSwitcher/*.dmg
+/mac/MonitorSwitcher/*.zip
+/windows/*.zip
+
+# 第三方源码自带的嵌套 git 仓库与编译中间产物
+/vendor/m1ddc/.git/
+/vendor/m1ddc/.objects/
+
+# dist/ 里的正式发布包需要入库，不要忽略
+/vendor/m1ddc/.git.disabled/
