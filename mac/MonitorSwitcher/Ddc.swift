@@ -163,13 +163,79 @@ enum Ddc {
     }
 
     /// 读当前输入源。读不到返回 nil（可能显示器睡着、或在非活动端）。
+    ///
+    /// 实测：显示器切离 USB-C 时，scaler 会让 Mac 侧整个 DDC/CI 从设备掉线，
+    /// 此时 `get input` 以及亮度/对比度都返回同一个随机噪声（如 34284 / 119 /
+    /// 26815），而不是「读不到」。这些噪声既不是端口值，也不能当作「弹回本机」。
+    /// 因此这里同时维护通道健康状态，供切屏流程决定是否复位。
     static func readInput() -> Int? {
         let text = run(["get", "input"])
         guard let v = Int(text) else { return nil }
         gate.lock()
         let ok = _knownValues.contains(v)
         gate.unlock()
+        healthGate.lock()
+        if ok {
+            _badReads = 0
+            _channelBroken = false
+        } else {
+            _badReads += 1
+            if _badReads >= 2 { _channelBroken = true }
+        }
+        healthGate.unlock()
         return ok ? v : nil
+    }
+
+    // MARK: - DDC 通道健康 / 复位
+
+    private static let healthGate = NSLock()
+    private static var _badReads = 0
+    private static var _channelBroken = false
+    private static var _lastReset = Date.distantPast
+
+    /// 连续读到非端口值的噪声：显示器 DDC 从设备已掉线。
+    static var channelBroken: Bool {
+        healthGate.lock(); defer { healthGate.unlock() }
+        return _channelBroken
+    }
+
+    static var badReads: Int {
+        healthGate.lock(); defer { healthGate.unlock() }
+        return _badReads
+    }
+
+    /// 让显示器睡眠再唤醒一次，scaler 会重新初始化 DDC 从设备。
+    /// 实测可把持续噪声的通道在 2 秒内恢复成稳定读数；20 秒内不重复执行。
+    /// 会短暂黑屏，必须在后台线程调用，且只在空闲/切屏失败收尾时使用。
+    static func resetChannel(force: Bool = false) {
+        healthGate.lock()
+        if !force && Date().timeIntervalSince(_lastReset) < 20 {
+            healthGate.unlock()
+            return
+        }
+        _lastReset = Date()
+        healthGate.unlock()
+
+        let sleep = Process()
+        sleep.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        sleep.arguments = ["displaysleepnow"]
+        sleep.standardOutput = Pipe()
+        sleep.standardError = Pipe()
+        try? sleep.run()
+        sleep.waitUntilExit()
+
+        Thread.sleep(forTimeInterval: 1.0)
+        let wake = Process()
+        wake.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
+        wake.arguments = ["-u", "-t", "3"]
+        wake.standardOutput = Pipe()
+        wake.standardError = Pipe()
+        try? wake.run()
+
+        healthGate.lock()
+        _badReads = 0
+        _channelBroken = false
+        healthGate.unlock()
     }
 
     /// 最近若干次 DDC 写操作。只用于诊断「切屏时两端是否互相重复写 0x60」，

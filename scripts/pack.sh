@@ -6,7 +6,7 @@
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VER="0.5.7"
+VER="0.5.8"
 DIST="$ROOT/dist"
 WIN="$ROOT/build/win"
 MACAPP="$ROOT/mac/MonitorSwitcher/KVMBridge.app"
@@ -25,7 +25,7 @@ cp "$WIN/KVMBridge.exe" "$TMP/win/"
 cp "$ROOT/windows/package/app.ico" "$TMP/win/"
 
 cat > "$TMP/mac/README-macOS.txt" <<'EOF'
-KVM Bridge 0.5.7 — macOS 端
+KVM Bridge 0.5.8 — macOS 端
 
 【安装】
 把 KVMBridge.app 拖进「应用程序」，双击运行，菜单栏会出现图标。
@@ -55,12 +55,22 @@ Ctrl+Option+1 切到 Mac，Ctrl+Option+2 切到 Windows。
 （一行数字，如 1.5 或 1.2），重启后即可调整，范围 0.25～4.0。
 端口后面能识别到所连主机系统时会显示 Windows / macOS / Linux，识别不到留空。
 
+【切换后显示器显示「无信号」】
+本显示器写完 DDC 切源指令后，DDC 通道会短暂失效，属显示器固件行为。
+菜单里有「复位显示器连接」，点一下会尝试重建通道（屏幕会短暂黑一下）。
+若仍无信号：按显示器电源键关机 10 秒再开机，这是最可靠的复位方式。
+然后用显示器按键手动切到 DisplayPort，确认 Windows 那路是否真有画面：
+  有画面 → 只是切换瞬间的 OSD 提示，可忽略；
+  无画面 → 检查 DP 线、OSD 里的 DisplayPort 版本、Windows 显示输出设置。
+OSD 里请把「输入源选择」设为自动（不要固定某个口），DDC/CI 保持开启。
+任何时刻按热键都能强制再切一次，不会因「状态未知」被拒绝。
+
 【注意】
 自研 TCP 协议无鉴权、无加密，请只在可信局域网使用。
 EOF
 
 cat > "$TMP/win/README-Windows.txt" <<'EOF'
-KVM Bridge 0.5.7 — Windows 端
+KVM Bridge 0.5.8 — Windows 端
 
 【运行】
 解压到任意文件夹（建议路径不含空格），双击 KVMBridge.exe。
@@ -91,6 +101,16 @@ Ctrl+Alt+1 切到 Mac，Ctrl+Alt+2 切到 Windows。
 共享鼠标速度默认已调快一档（1.3 倍）；在 Windows 端 exe 同目录写 speed.txt
 （一行数字，如 1.5 或 1.2），重启后即可调整，范围 0.25～4.0。
 端口后面能识别到所连主机系统时会显示 Windows / macOS / Linux，识别不到留空。
+
+【切换后显示器显示「无信号」】
+本显示器写完 DDC 切源指令后，DDC 通道会短暂失效，属显示器固件行为。
+菜单里有「复位显示器连接」，点一下会尝试重建通道（屏幕会短暂黑一下）。
+若仍无信号：按显示器电源键关机 10 秒再开机，这是最可靠的复位方式。
+然后用显示器按键手动切到 DisplayPort，确认 Windows 那路是否真有画面：
+  有画面 → 只是切换瞬间的 OSD 提示，可忽略；
+  无画面 → 检查 DP 线、OSD 里的 DisplayPort 版本、Windows 显示输出设置。
+OSD 里请把「输入源选择」设为自动（不要固定某个口），DDC/CI 保持开启。
+任何时刻按热键都能强制再切一次，不会因「状态未知」被拒绝。
 
 【注意】
 Windows 未检测到任何物理鼠标时不会绘制鼠标指针，

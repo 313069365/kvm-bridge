@@ -205,6 +205,8 @@ final class DebugServer {
                 "autoStart=" + String(app?.autoStartEnabled ?? true),
                 "display=" + Ddc.displayName,
                 "ddcOK=" + String(Ddc.ddcAvailable),
+            "ddcBad=" + String(Ddc.badReads),
+            "ddcBroken=" + String(Ddc.channelBroken),
                 "ports=" + String(Ddc.portsDetected),
                 "peerOS=" + (app?.peerOS ?? "-"),
                 "kb=" + String(app?.shareKeyboard ?? true),

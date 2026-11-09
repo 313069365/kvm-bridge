@@ -381,6 +381,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         autoStartItem.target = self
         menu.addItem(autoStartItem)
 
+        let resetLink = NSMenuItem(title: "复位显示器连接", action: #selector(resetDisplayLink), keyEquivalent: "")
+        resetLink.target = self
+        menu.addItem(resetLink)
+
         menu.addItem(NSMenuItem.separator())
 
         let quit = NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q")
@@ -939,6 +943,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stopForwarding()
         Toast.shared.show("已紧急释放：键鼠回到本机")
         refresh()
+    }
+
+    /// 显示器 DDC 从设备掉线时（读回噪声、切屏后无信号）手动复位一次。
+    /// 让显示器睡眠再唤醒，scaler 会重新初始化 DDC/CI，实测 2 秒内恢复读数。
+    @objc private func resetDisplayLink() {
+        Toast.shared.show("正在复位显示器连接…")
+        DispatchQueue.global(qos: .utility).async {
+            Ddc.resetChannel(force: true)
+            DispatchQueue.main.async {
+                Toast.shared.show("显示器连接已复位，可重新切换屏幕")
+                self.refresh()
+            }
+        }
     }
 
     @objc private func quitApp() {

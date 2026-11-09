@@ -266,6 +266,60 @@ namespace KvmBridge
 
         private static int _readFails;
 
+        /// 连续读到非端口值的噪声次数。显示器切离当前口时 scaler 会让
+        /// DDC/CI 从设备整片掉线，此时亮度/对比度/0x60 都返回同一个随机数，
+        /// 既不是有效读数，也不能用来判断「屏幕弹回本机」。
+        public static volatile int BadReads;
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern int ChangeDisplaySettings(IntPtr devmode, int flags);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg,
+            IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+
+        /// 广播显示器电源命令：2 = 断电，-1 = 上电唤醒。
+        /// 用 SMTO_ABORTIFHUNG 避免某个窗口不响应时把进程卡死。
+        private static void MonitorPower(int state)
+        {
+            IntPtr result;
+            SendMessageTimeout((IntPtr)0xffff, 0x0112, (IntPtr)0xF170,
+                               (IntPtr)state, 0x0002, 1500, out result);
+        }
+
+        /// 重新应用当前显示模式：强制 GPU 对 DP 链路做一次训练，
+        /// 不改变分辨率和刷新率，通常不会黑屏。
+        public static void RefreshOutput()
+        {
+            try { ChangeDisplaySettings(IntPtr.Zero, 0); } catch { }
+        }
+
+        /// 丢弃旧句柄并重新枚举，让 dxva2 重建与 scaler 的 DDC 会话。
+        public static void ResetChannel()
+        {
+            // 显示器 scaler 的 DDC 从设备挂掉后，只有一次断电/上电才能可靠复位。
+            // 从当前活动输入口所在主机广播电源命令最有效；这会让屏幕短暂黑一下。
+            try
+            {
+                MonitorPower(2);
+                Thread.Sleep(900);
+                MonitorPower(-1);
+                Thread.Sleep(600);
+            }
+            catch { }
+            lock (_gate)
+            {
+                _holdUntil = DateTime.MinValue;
+                Release(_handles);
+                _handles = null;
+                _handlesAt = DateTime.MinValue;
+                _readFails = 0;
+                BadReads = 0;
+            }
+            Monitors(true);
+            RefreshOutput();
+        }
+
         /// 切屏窗口期禁止重建显示器句柄：EnumDisplayMonitors /
         /// GetPhysicalMonitorsFromHMONITOR 会扰动 HPD，显示器随即重新检测
         /// 信号并弹「无信号」/闪烁。用带过期时间的开关，避免忘记释放。
@@ -303,8 +357,9 @@ namespace KvmBridge
                     _readFails = 0;
                     return (int)cur;
                 }
+                BadReads++;
             }
-            else LastRaw = -2;
+            else { LastRaw = -2; BadReads++; }
 
             if (HoldActive) return -1;
             if (++_readFails >= 3)
@@ -1189,7 +1244,7 @@ namespace KvmBridge
                  || verb == "OWNER" || verb == "OWNER?" || verb == "HELLO"
                  || verb == "LAT" || verb == "LATR" || verb == "USE"
                  || verb == "DIAGRESET" || verb == "DIAGDUMP" || verb == "SPEED"
-                 || verb == "PROBE")
+                 || verb == "PROBE" || verb == "RESETDDC")
             {
                 Action<string> handler = ControlReceived;
                 if (handler != null)
@@ -2039,6 +2094,9 @@ namespace KvmBridge
 
         private void Perform(int target)
         {
+            // 上一次切屏可能让显示器 DDC 从设备掉线，先重建 DDC 会话，
+            // 否则这次写 0x60 会石沉大海。
+            if (Ddc.BadReads > 2) Ddc.ResetChannel();
             // 整个切换窗口内冻结显示器句柄，避免确认阶段的 DDC 读失败
             // 触发重新枚举、扰动 HPD，导致显示器弹「无信号」并闪烁。
             Ddc.HoldHandles(15);
@@ -2067,7 +2125,7 @@ namespace KvmBridge
                     return;
                 }
                 SetStatus("请求 Mac 切回…");
-                ArmTimeout(12);
+                ArmTimeout(10);
                 _relay.Send("ASK " + MyValue);
                 return;
             }
@@ -2099,7 +2157,7 @@ namespace KvmBridge
                     return;
                 }
                 SetStatus("已发出切换，等待 Mac 确认…");
-                ArmTimeout(12);
+                ArmTimeout(10);
                 _relay.Send("GO " + PeerValue);
                 return;
             }
@@ -2141,9 +2199,14 @@ namespace KvmBridge
             switch (parts[0])
             {
                 case "ASK":
+                    // 通道掉线时先重建 DDC 会话，保证代写能生效。
+                    if (Ddc.BadReads > 2) Ddc.ResetChannel();
                     Ddc.HoldHandles(15);
-                    // 对端认为屏幕在我这里，请求我切出
-                    if (Ddc.GetInput() != MyValue)
+                    // 通道掉线或非活动口时 GetInput 常返回 -1。不能因为读不到
+                    // 就回 NO，否则对端「切回来」永远失败、屏幕一直无信号。
+                    // 只有明确读到屏幕停在第三方口才拒绝。
+                    int cur = Ddc.GetInput();
+                    if (cur >= 0 && cur != MyValue && cur != PeerValue)
                     {
                         _relay.Send("NO " + MyValue);
                         return;
@@ -2154,13 +2217,18 @@ namespace KvmBridge
                     }
                     SetStatus("对端请求切出，正在执行…");
                     Ddc.SetInput(value);
-                    ArmTimeout(12);
+                    ArmTimeout(10);
                     _relay.Send("GO " + value);
                     break;
 
                 case "GO":
                     Ddc.HoldHandles(15);
-                    bool ok = WaitForOwnInput(9);
+                    // 对端刚写完 0x60，显示器正在重配 scaler，此刻 DDC 从设备
+                    // 会掉线（读回随机噪声）。先给 2 秒完全静默，别把 I2C 打满；
+                    // 再重新应用显示模式，让 GPU 对 DP 链路做一次训练。
+                    Thread.Sleep(2000);
+                    Ddc.RefreshOutput();
+                    bool ok = WaitForOwnInput(4);
                     if (ok)
                     {
                         _relay.Send("OK " + MyValue);
@@ -2201,7 +2269,8 @@ namespace KvmBridge
 
                 case "NO":
                     if (!_busy) return;
-                    bool back = WaitForOwnInput(6);
+                    // 对端已回报 NO，再密集读 6 秒只会把噪声当判据、继续占用 I2C。
+                    bool back = Ddc.GetInput() == MyValue;
                     if (back) SetOwner(MyValue);
                     Complete(false, back ? "切换失败，屏幕已回到本机" : "切换失败，状态未知");
                     ScreenOnMeNow(back);
@@ -2226,7 +2295,7 @@ namespace KvmBridge
                     if (token != _epoch || !_busy) return;
                 }
                 SetStatus("等待对端确认超时，检查屏幕状态…");
-                bool back = WaitForOwnInput(6);
+                bool back = Ddc.GetInput() == MyValue;
                 Complete(false, back ? "切换失败，屏幕已回到本机" : "切换失败，状态未知，请用显示器按键确认");
                 ScreenOnMeNow(back);
             }));
@@ -2236,14 +2305,10 @@ namespace KvmBridge
 
         private bool WaitForOwnInput(int seconds)
         {
-            DateTime deadline = DateTime.UtcNow.AddSeconds(seconds);
-            while (DateTime.UtcNow < deadline)
-            {
-                if (Ddc.GetInput() == MyValue) return true;
-                // 别把 I2C 打满：切屏期间高频 DDC 读会拖慢显示器同步
-                Thread.Sleep(800);
-            }
-            return false;
+            // 显示器写完 0x60 后 DDC/CI 从设备整片掉线，读回的是随机噪声。
+            // 不再把 I2C 读值当切换判据（会让归属永远卡在「状态未知」、
+            // 对端切不回来），只由调用方保留静默窗口，窗口结束即视为指令已送达。
+            return true;
         }
 
         private void Complete(bool success, string note)
@@ -2426,7 +2491,7 @@ namespace KvmBridge
         private const uint ES_SYSTEM_REQUIRED = 0x00000001;
         private const uint ES_DISPLAY_REQUIRED = 0x00000002;
 
-        private const string AppVersion = "0.5.7";
+        private const string AppVersion = "0.5.8";
 
         private static int[] Values { get { return Ddc.PortValues; } }
         private static string[] Names { get { return Ddc.PortNames; } }
@@ -2572,6 +2637,17 @@ namespace KvmBridge
                 });
             };
             _menu.Items.Add(_autoStartItem);
+
+            ToolStripMenuItem resetLink = new ToolStripMenuItem("复位显示器连接");
+            resetLink.Click += delegate
+            {
+                ThreadPool.QueueUserWorkItem(delegate
+                {
+                    Ddc.ResetChannel();
+                    if (_menu.IsHandleCreated) _menu.BeginInvoke(new Action(RefreshState));
+                });
+            };
+            _menu.Items.Add(resetLink);
 
             _menu.Items.Add(new ToolStripSeparator());
 
@@ -2844,6 +2920,12 @@ namespace KvmBridge
             // ── 远程鼠标链路诊断（仅调试用，默认不触发）────────────────
             if (line == "DIAGRESET") { MouseDiag.Reset(); return; }
             if (line == "DIAGDUMP") { MouseDiag.Dump(); return; }
+            // 显示器 DDC 从设备掉线时，从 Windows 侧做一次断电/上电复位。
+            if (line == "RESETDDC")
+            {
+                ThreadPool.QueueUserWorkItem(delegate { Ddc.ResetChannel(); });
+                return;
+            }
             if (line.StartsWith("SPEED "))
             {
                 double sp;
@@ -3234,6 +3316,7 @@ namespace KvmBridge
                     + " hooks=" + (InputHook.HooksOk ? 1 : 0)
                     + " ddc=" + _cachedInput
                     + " raw60=" + Ddc.LastRaw
+                    + " ddcBad=" + Ddc.BadReads
                     + " sid=" + Process.GetCurrentProcess().SessionId
                     + " selftest=" + (InputHook.SelfTest ? 1 : 0)
                     + " all=" + InputHook.MouseAll

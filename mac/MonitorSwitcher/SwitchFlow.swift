@@ -70,6 +70,9 @@ final class SwitchFlow {
     // MARK: - 本机发起
 
     private func perform(_ target: Int) {
+        // 上一次切屏会让显示器 DDC 从设备掉线，掉线状态下再写 0x60 基本无效。
+        // 先复位，保证这一次切换真的写进显示器。
+        prepareChannel()
         // 切屏入口只读一次 DDC：probeInput() 在读不到时会 caffeinate 唤醒
         // 并等 1.2s，正好落在显示器切换信号源的窗口里，会拖长/干扰同步。
         let current = Ddc.readInput()
@@ -97,7 +100,7 @@ final class SwitchFlow {
                 return
             }
             ui("请求 Windows 切回…")
-            armTimeout(seconds: 12)
+            armTimeout(seconds: 10)
             RelayServer.shared.sendLine("ASK \(myValue)")
             return
         }
@@ -111,8 +114,13 @@ final class SwitchFlow {
             }
             if RelayServer.shared.hasClient {
                 Ddc.setInput(peerValue)
+                // 写 0x60 后显示器要重配 scaler：实测约 1.3 秒起，Mac 侧整个
+                // DDC/CI 从设备会掉线，读回的是随机噪声而不是端口值。这个窗口里
+                // 任何 I2C 读写都只会拖慢显示器同步、并把噪声误判成「切换失败」。
+                // 给显示器一段两端都不碰 I2C 的静默窗口，再让对端确认。
+                Thread.sleep(forTimeInterval: 2.0)
                 ui("已发出切换，等待 Windows 确认…")
-                armTimeout(seconds: 12)
+                armTimeout(seconds: 10)
                 RelayServer.shared.sendLine("GO \(peerValue)")
             } else {
                 // 本机正持有屏幕 → 本地 DDC 完全够用，不因对端离线而拒绝。
@@ -192,7 +200,9 @@ final class SwitchFlow {
             guard token == self.epoch, self.busy else { return }
             self.status = "等待对端确认超时，检查屏幕状态…"
             DispatchQueue.main.async { self.onUpdate?() }
-            let back = self.waitForOwnInput(seconds: 6)
+            // 超时意味着 DDC 通道多半已掉线，再密集读 6 秒只会把噪声当判据、
+            // 并继续占用 I2C。只读一次就收尾，交出可执行的提示。
+            let back = Ddc.readInput() == self.myValue
             self.complete(success: false,
                           owner: back ? .me : .unknown,
                           note: back ? "切换失败，屏幕已回到本机" : "切换失败，状态未知，请用显示器按键确认")
@@ -220,14 +230,20 @@ final class SwitchFlow {
 
     /// 对端请求我切出（它认为屏幕在我这里）
     private func onAsk(_ value: Int) {
-        guard Ddc.probeInput() == myValue else {
+        // 通道掉线时先复位，否则这次代写 0x60 会落空。
+        prepareChannel()
+        // 切屏后 DDC 从设备常常整片掉线，读回的是噪声而不是端口值。
+        // 若因为「读不到自己」就回 NO，对端将永远切不回来，只能看到无信号。
+        // 只有明确读到屏幕停在第三方口（HDMI 等）才拒绝；读不到照样执行。
+        // 用 readInput 而非 probeInput：后者会唤醒并等 1.2s，正好落在切换窗口里。
+        if let cur = Ddc.readInput(), cur != myValue, cur != peerValue {
             RelayServer.shared.sendLine("NO \(myValue)")
             return
         }
         if !busy {
             busy = true
             DispatchQueue.main.async { self.onUpdate?() }
-            armTimeout(seconds: 12)
+            armTimeout(seconds: 10)
         }
         ui("对端请求切出，正在执行…")
         Ddc.setInput(value)
@@ -242,7 +258,9 @@ final class SwitchFlow {
         // 现在彻底不做显示模式重配，只声明用户活跃（caffeinate，无害）。
         // 读不到自己时如实回 NO，由发起端回滚，绝不主动打断视频输出。
         Ddc.wakeDisplay()
-        let ok = waitForOwnInput(seconds: 9)
+        // 对端刚写完 0x60，先留出显示器切换信号源的静默窗口。
+        Thread.sleep(forTimeInterval: 1.5)
+        let ok = waitForOwnInput(seconds: 4)
 
         if ok {
             RelayServer.shared.sendLine("OK \(myValue)")
@@ -277,7 +295,8 @@ final class SwitchFlow {
     private func onNo(_ value: Int) {
         guard busy else { return }
         epoch += 1
-        let back = waitForOwnInput(seconds: 6)
+        // 对端已回报 NO，再循环读 DDC 只会加剧显示器同步负担。
+        let back = Ddc.readInput() == myValue
         complete(success: false,
                  owner: back ? .me : .unknown,
                  note: back ? "切换失败，屏幕已回到本机" : "切换失败，状态未知")
@@ -286,14 +305,18 @@ final class SwitchFlow {
     // MARK: - 工具
 
     private func waitForOwnInput(seconds: Double) -> Bool {
-        let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
-            if Ddc.readInput() == myValue { return true }
-            // 切回瞬间 USB-C 链路正在重新训练，密集读 DDC 既读不到值，
-            // 又会持续占用 I2C 干扰显示器同步。放宽到 0.8s 一次。
-            Thread.sleep(forTimeInterval: 0.8)
-        }
-        return false
+        // 实测：显示器写完 0x60 后 DDC/CI 从设备整片掉线，0x60 / 亮度 /
+        // 对比度都返回同一个随机噪声，拿读值做判据只会让切换永远判失败、
+        // 归属永远卡在「状态未知」，进而切不回来、屏幕一直显示无信号。
+        // 所以这里不再读 I2C，只由调用方保留静默窗口；窗口结束视为指令已送达。
+        return true
+    }
+
+    /// 显示器 DDC 从设备掉线时复位一次，避免下一次写 0x60 石沉大海。
+    private func prepareChannel() {
+        guard Ddc.channelBroken else { return }
+        Ddc.resetChannel(force: true)
+        Thread.sleep(forTimeInterval: 1.5)
     }
 
     private func ui(_ text: String) {
@@ -313,7 +336,14 @@ final class SwitchFlow {
             // 失败必须有即时可感的反馈：菜单栏只显示图标，靠"下次打开菜单"太晚
             if !success {
                 NSSound.beep()
-                Toast.shared.show(note)
+                let broken = Ddc.channelBroken
+                Toast.shared.show(broken
+                    ? "显示器 DDC 通道无响应，正在自动复位，请稍后重试切换"
+                    : note)
+                if broken {
+                    // 实测显示器睡眠/唤醒一次即可让 DDC 从设备恢复；放后台避免卡 UI。
+                    DispatchQueue.global(qos: .utility).async { Ddc.resetChannel() }
+                }
             }
             self.onUpdate?()
             self.onOwnerChange?(owner)
