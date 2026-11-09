@@ -252,6 +252,8 @@ namespace KvmBridge
         {
             lock (_gate)
             {
+                // 切屏窗口内即使缓存过期也不重新枚举，避免 HPD 扰动。
+                if (_handles != null && _handles.Count > 0 && HoldActive) return _handles;
                 if (!refresh && _handles != null && _handles.Count > 0
                     && (DateTime.UtcNow - _handlesAt).TotalSeconds < 60)
                     return _handles;
@@ -264,32 +266,58 @@ namespace KvmBridge
 
         private static int _readFails;
 
+        /// 切屏窗口期禁止重建显示器句柄：EnumDisplayMonitors /
+        /// GetPhysicalMonitorsFromHMONITOR 会扰动 HPD，显示器随即重新检测
+        /// 信号并弹「无信号」/闪烁。用带过期时间的开关，避免忘记释放。
+        private static DateTime _holdUntil = DateTime.MinValue;
+        private static bool HoldActive
+        {
+            get { return DateTime.UtcNow < _holdUntil; }
+        }
+        public static void HoldHandles(int seconds)
+        {
+            DateTime until = DateTime.UtcNow.AddSeconds(seconds);
+            if (until > _holdUntil) _holdUntil = until;
+        }
+
+        /// 最后一次 VCP 0x60 的原始读数（即使不在已知端口表里也保留），
+        /// 用于诊断切换瞬间显示器返回的中间值。
+        public static volatile int LastRaw = -2;
+
         public static int GetInput()
         {
             // 屏幕切走后本机是非活动输入口，本来就常读不到 DDC。
             // 这时绝不能每轮都重建显示器句柄——反复枚举会扰动 HPD，
-            // 正是「无信号 + 闪烁」的来源。连续失败 3 次才重建一次。
+            // 正是「无信号 + 闪烁」的来源。切屏窗口内一律只用缓存句柄。
             List<PHYSICAL_MONITOR> mons = Monitors(false);
             uint type;
             uint cur;
             uint max;
             if (mons.Count > 0
                 && GetVCPFeatureAndVCPFeatureReply(mons[0].hPhysicalMonitor, 0x60,
-                        out type, out cur, out max)
-                && IsKnown((int)cur))
+                        out type, out cur, out max))
             {
-                _readFails = 0;
-                return (int)cur;
+                LastRaw = (int)cur;
+                if (IsKnown((int)cur))
+                {
+                    _readFails = 0;
+                    return (int)cur;
+                }
             }
+            else LastRaw = -2;
 
+            if (HoldActive) return -1;
             if (++_readFails >= 3)
             {
                 _readFails = 0;
                 mons = Monitors(true);
                 if (mons.Count > 0
                     && GetVCPFeatureAndVCPFeatureReply(mons[0].hPhysicalMonitor, 0x60,
-                            out type, out cur, out max)
-                    && IsKnown((int)cur)) return (int)cur;
+                            out type, out cur, out max))
+                {
+                    LastRaw = (int)cur;
+                    if (IsKnown((int)cur)) return (int)cur;
+                }
             }
             return -1;
         }
@@ -314,8 +342,9 @@ namespace KvmBridge
                 _writes.Add(DateTime.Now.ToString("HH:mm:ss.fff") + ":" + value);
                 if (_writes.Count > 24) _writes.RemoveAt(0);
             }
-            // 写 DDC 只在切屏时发生，频率极低，重建一次句柄保证有效。
-            List<PHYSICAL_MONITOR> mons = Monitors(true);
+            // 切屏瞬间不要重新枚举显示器：用缓存句柄即可，枚举会扰动 HPD。
+            List<PHYSICAL_MONITOR> mons = Monitors(false);
+            if (mons.Count == 0) mons = Monitors(true);
             for (int i = 0; i < mons.Count; i++)
             {
                 SetVCPFeature(mons[i].hPhysicalMonitor, 0x60, (uint)value);
@@ -870,6 +899,35 @@ namespace KvmBridge
             {
                 try { File.WriteAllText(FilePath(), ip + "\r\n"); } catch { }
             }
+        }
+    }
+
+    /// 鼠标手感倍率的用户偏好：远程 SPEED 命令写入，重启后仍然生效。
+    internal static class SpeedFile
+    {
+        private static string FilePath()
+        {
+            return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "speed.txt");
+        }
+        public static double Load()
+        {
+            try
+            {
+                double v;
+                if (double.TryParse(File.ReadAllText(FilePath()).Trim(), NumberStyles.Float,
+                                    CultureInfo.InvariantCulture, out v)) return v;
+            }
+            catch { }
+            return 0;
+        }
+        public static void Save(double v)
+        {
+            try
+            {
+                File.WriteAllText(FilePath(),
+                    v.ToString("0.###", CultureInfo.InvariantCulture) + "\r\n");
+            }
+            catch { }
         }
     }
 
@@ -1523,8 +1581,10 @@ namespace KvmBridge
         private static double _accSY;
         /// 手感倍率：硬件 count 与对端逻辑点之间的换算不是纯几何比例，
         /// Windows 的「提高指针精确度」会让快速甩动被系统放大，而 Mac 端
-        /// 用绝对坐标注入没有加速。这个系数用于补偿，默认 1（纯尺寸比例）。
-        private static double _speed = 1.0;
+        /// 用绝对坐标注入没有加速。纯尺寸比例（0.5）实测偏慢，默认给一档
+        /// 温和补偿；可在运行时用 SPEED 命令调整，偏好保存到 speed.txt。
+        private const double DefaultSpeed = 1.3;
+        private static double _speed = DefaultSpeed;
 
         public static void SetSpeed(double s)
         {
@@ -1961,6 +2021,9 @@ namespace KvmBridge
 
         private void Perform(int target)
         {
+            // 整个切换窗口内冻结显示器句柄，避免确认阶段的 DDC 读失败
+            // 触发重新枚举、扰动 HPD，导致显示器弹「无信号」并闪烁。
+            Ddc.HoldHandles(15);
             int cur = Ddc.GetInput();
 
             // ① 切到自己
@@ -2060,6 +2123,7 @@ namespace KvmBridge
             switch (parts[0])
             {
                 case "ASK":
+                    Ddc.HoldHandles(15);
                     // 对端认为屏幕在我这里，请求我切出
                     if (Ddc.GetInput() != MyValue)
                     {
@@ -2077,6 +2141,7 @@ namespace KvmBridge
                     break;
 
                 case "GO":
+                    Ddc.HoldHandles(15);
                     bool ok = WaitForOwnInput(9);
                     if (ok)
                     {
@@ -2158,7 +2223,7 @@ namespace KvmBridge
             {
                 if (Ddc.GetInput() == MyValue) return true;
                 // 别把 I2C 打满：切屏期间高频 DDC 读会拖慢显示器同步
-                Thread.Sleep(500);
+                Thread.Sleep(800);
             }
             return false;
         }
@@ -2336,7 +2401,7 @@ namespace KvmBridge
         private const uint ES_SYSTEM_REQUIRED = 0x00000001;
         private const uint ES_DISPLAY_REQUIRED = 0x00000002;
 
-        private const string AppVersion = "0.5.5";
+        private const string AppVersion = "0.5.6";
 
         private static int[] Values { get { return Ddc.PortValues; } }
         private static string[] Names { get { return Ddc.PortNames; } }
@@ -2739,7 +2804,11 @@ namespace KvmBridge
             {
                 double sp;
                 if (double.TryParse(line.Substring(6).Trim(), NumberStyles.Float,
-                                    CultureInfo.InvariantCulture, out sp)) InputHook.SetSpeed(sp);
+                                    CultureInfo.InvariantCulture, out sp))
+                {
+                    InputHook.SetSpeed(sp);
+                    SpeedFile.Save(sp);
+                }
                 return;
             }
             if (line.StartsWith("PROBE "))
@@ -3109,6 +3178,7 @@ namespace KvmBridge
                     + " capM=" + (InputHook.CaptureMouse ? 1 : 0)
                     + " hooks=" + (InputHook.HooksOk ? 1 : 0)
                     + " ddc=" + _cachedInput
+                    + " raw60=" + Ddc.LastRaw
                     + " sid=" + Process.GetCurrentProcess().SessionId
                     + " selftest=" + (InputHook.SelfTest ? 1 : 0)
                     + " all=" + InputHook.MouseAll
@@ -3182,6 +3252,10 @@ namespace KvmBridge
             // 仍未发现也不猜内网地址：回退本机回环，程序照常启动（切屏不依赖网络），
             // 后台发现线程拿到地址后会立即切换过去。
             if (string.IsNullOrEmpty(host)) host = "127.0.0.1";
+
+            // 用户调过的鼠标倍率优先于默认值（远程 SPEED 命令写入 speed.txt）。
+            double savedSpeed = SpeedFile.Load();
+            if (savedSpeed > 0) InputHook.SetSpeed(savedSpeed);
 
             timeBeginPeriod(1);
             try

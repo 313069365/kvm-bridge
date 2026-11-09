@@ -70,7 +70,9 @@ final class SwitchFlow {
     // MARK: - 本机发起
 
     private func perform(_ target: Int) {
-        let current = Ddc.probeInput()
+        // 切屏入口只读一次 DDC：probeInput() 在读不到时会 caffeinate 唤醒
+        // 并等 1.2s，正好落在显示器切换信号源的窗口里，会拖长/干扰同步。
+        let current = Ddc.readInput()
         let active = (current == myValue)
         print("[Flow] perform target=\(target) current=\(String(describing: current)) connected=\(RelayServer.shared.hasClient)")
 
@@ -142,7 +144,7 @@ final class SwitchFlow {
         ui("对端离线，直接写 DDC \(target)（不依赖网络）…")
         Ddc.setInput(target)
         Thread.sleep(forTimeInterval: 3.0)
-        if Ddc.probeInput() == myValue {
+        if Ddc.readInput() == myValue {
             complete(success: false, owner: .me, note: "切换失败：屏幕弹回了本机")
         } else {
             // 成功也必须给即时反馈：切走后本机不再是活动输入口，写 DDC 无效，

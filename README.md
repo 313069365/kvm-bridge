@@ -2,7 +2,9 @@
 
 让一台显示器和一套键鼠在 **macOS** 与 **Windows** 两台主机之间共用。两端程序完全对等，任意一端都能切换屏幕、切换键鼠模式。
 
-当前版本：**0.5.5**
+当前版本：**0.5.6**
+
+0.5.6 调整：共享鼠标速度上调一档（硬件位移 × 屏幕比例 × 1.3），偏好写入 Windows 端 `speed.txt`、重启保留；切屏窗口内冻结显示器句柄枚举，避免 DDC 读失败触发 `EnumDisplayMonitors` 扰动 HPD 而弹「无信号」；确认阶段 DDC 读间隔由 500ms 放宽到 800ms，切屏入口不再做「唤醒 + 1.2s 等待」；状态文件新增 `raw60=` 原始 VCP 读数。
 
 0.5.5 修复：Windows 端 `RAWMOUSE` 结构体此前多出一个 `ulButtons`、又少了 2 字节对齐填充，导致 `lLastX` 实际读到的是真实的 `lLastY`、`lLastY` 恒为 0 —— 表现为共享鼠标「只能在一条线上移动」。现按 `winuser.h` 修正布局（`Pack=4`，`lLastX@12 / lLastY@16`），加入布局自检与逐帧位移诊断，实测真实硬件帧双轴均有值。共享模式下「键盘」「鼠标」后还会实时显示当前生效的是哪台设备的键鼠（macOS / Windows），由持有屏幕的一端裁决并同步到对端。0.5.4 起 Windows 使用 Raw Input 硬件相对位移、Mac 注入器连续注入期间不回读光标。
 
@@ -25,6 +27,10 @@
 
 > 共享鼠标使用 Windows **Raw Input** 的硬件相对位移，并按两端屏幕比例换算（4K 物理像素 → macOS 逻辑点）；不经过指针加速，也不受 DPI 虚拟化与光标回中影响。结构体布局严格按 `winuser.h` 对齐并带运行时自检，避免只读到单轴位移。Raw Input 不可用时自动降级到低级钩子，并做同样的缩放与限幅。
 
+> 共享鼠标默认带 1.3 倍手感补偿：Windows 开着「提高指针精确度」，纯几何比例（0.5）实测偏慢。在 Windows 端 exe 同目录写 `speed.txt`（一行数字，如 `1.5` 或 `1.2`，范围 0.25～4.0），重启后生效；也可运行时用 `SPEED` 命令远程微调。实测 100 帧 `(4,0)` → `raw 400 → 缩放 260 → 光标 +260`，线性无丢帧。
+
+> 切屏窗口内会冻结显示器句柄枚举：DDC 读失败时反复 `EnumDisplayMonitors` 会扰动 HPD，是显示器弹「无信号」/闪烁的一个来源。确认阶段读间隔放宽到 800ms，状态文件新增 `raw60=` 原始 VCP 读数便于定位。
+
 > 显示器完全不支持 DDC/CI 时，菜单只显示一行精简提示「该显示器不支持」，并禁用输入源项。支持时不会显示任何多余说明。
 
 ---
@@ -35,9 +41,9 @@
 
 | 文件 | 平台 | 说明 |
 |---|---|---|
-| `KVMBridge-0.5.5-mac.dmg` | macOS（Apple Silicon） | 拖入「应用程序」 |
-| `KVMBridge-0.5.5-mac.zip` | macOS（Apple Silicon） | 同上，zip 版 |
-| `KVMBridge-0.5.5-win.zip` | Windows 10 / 11 | 解压后直接运行 `KVMBridge.exe` |
+| `KVMBridge-0.5.6-mac.dmg` | macOS（Apple Silicon） | 拖入「应用程序」 |
+| `KVMBridge-0.5.6-mac.zip` | macOS（Apple Silicon） | 同上，zip 版 |
+| `KVMBridge-0.5.6-win.zip` | Windows 10 / 11 | 解压后直接运行 `KVMBridge.exe` |
 
 ### macOS 端
 1. 把 `KVMBridge.app` 拖进「应用程序」并运行，菜单栏出现图标。
@@ -102,7 +108,7 @@ windows/package/       Windows 端 C# 源码
                        （托盘、DDC、协议、钩子、自动发现、计划任务自启）
 vendor/m1ddc/          DDC/CI 命令行工具（源码 + 预编译 arm64 二进制）
 scripts/pack.sh        双端安装包打包脚本
-dist/                 0.5.5 可运行安装包
+dist/                 0.5.6 可运行安装包
 DESIGN.md             系统设计
 UI-SPEC.md            界面规格
 ```
@@ -127,7 +133,7 @@ UI-SPEC.md            界面规格
 ## 校验和（SHA-256）
 
 ```
-483a0bb8724c8070bc2f8a8c095bb45f69ebde21b2f51f245db12f4591f41d64  KVMBridge-0.5.5-mac.dmg
-37d8d34ac229462bcf0eb74f8c63176c6a7b33ed67c4ce75b5fa7ac6e4c301b5  KVMBridge-0.5.5-mac.zip
-51810af5bbeab40d12c93e83c52484e86084670857e878f4910a79c821b557db  KVMBridge-0.5.5-win.zip
+0236f31bb497028df828ab4855b47816a2694bd7c06cd0b43e291d9f5eb508aa  KVMBridge-0.5.6-mac.dmg
+73930acd1e61a8ac2b225b0b94cca7e2e1a260796088ffc8223d1d7136bfd913  KVMBridge-0.5.6-mac.zip
+f1b10371442136c49f9a794b9cd211bcf2273790d700f22ec2bd2db4655644d8  KVMBridge-0.5.6-win.zip
 ```
