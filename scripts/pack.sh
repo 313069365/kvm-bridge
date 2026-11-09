@@ -6,7 +6,7 @@
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VER="0.5.4"
+VER="0.5.5"
 DIST="$ROOT/dist"
 WIN="$ROOT/build/win"
 MACAPP="$ROOT/mac/MonitorSwitcher/KVMBridge.app"
@@ -25,7 +25,7 @@ cp "$WIN/KVMBridge.exe" "$TMP/win/"
 cp "$ROOT/windows/package/app.ico" "$TMP/win/"
 
 cat > "$TMP/mac/README-macOS.txt" <<'EOF'
-KVM Bridge 0.5.4 — macOS 端
+KVM Bridge 0.5.5 — macOS 端
 
 【安装】
 把 KVMBridge.app 拖进「应用程序」，双击运行，菜单栏会出现图标。
@@ -50,6 +50,7 @@ Windows 端会自动发现并连上，无需配置任何 IP；发现到的地址
 【使用】
 Ctrl+Option+1 切到 Mac，Ctrl+Option+2 切到 Windows。
 菜单「键鼠」可切换独立模式 / 共享模式；共享模式下可分别勾选键盘、鼠标。
+共享时两行后面会实时显示当前生效的是哪台设备的键鼠（macOS / Windows），两端同步。
 端口后面能识别到所连主机系统时会显示 Windows / macOS / Linux，识别不到留空。
 
 【注意】
@@ -57,7 +58,7 @@ Ctrl+Option+1 切到 Mac，Ctrl+Option+2 切到 Windows。
 EOF
 
 cat > "$TMP/win/README-Windows.txt" <<'EOF'
-KVM Bridge 0.5.4 — Windows 端
+KVM Bridge 0.5.5 — Windows 端
 
 【运行】
 解压到任意文件夹（建议路径不含空格），双击 KVMBridge.exe。
@@ -84,6 +85,7 @@ app.ico 必须和 exe 放在同一目录（托盘图标）。
 【使用】
 Ctrl+Alt+1 切到 Mac，Ctrl+Alt+2 切到 Windows。
 菜单可切换独立模式 / 共享模式；共享模式下可分别勾选键盘、鼠标。
+共享时两行后面会实时显示当前生效的是哪台设备的键鼠（macOS / Windows），两端同步。
 端口后面能识别到所连主机系统时会显示 Windows / macOS / Linux，识别不到留空。
 
 【注意】

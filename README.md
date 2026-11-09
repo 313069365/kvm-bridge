@@ -2,9 +2,9 @@
 
 让一台显示器和一套键鼠在 **macOS** 与 **Windows** 两台主机之间共用。两端程序完全对等，任意一端都能切换屏幕、切换键鼠模式。
 
-当前版本：**0.5.4**
+当前版本：**0.5.5**
 
-0.5.4 修复：Windows 端改用 **Raw Input 硬件相对位移**替代被指针加速／DPI／屏幕边界污染的绝对坐标差，并按两端屏幕尺度换算；Mac 注入器连续注入期间不再回读异步滞后的系统光标（消除光标跳回旧位置）；切回路径彻底移除显示模式重配。0.5.3 起两端静止时不再轮询 DDC，切屏每次只写一次 `0x60`。
+0.5.5 修复：Windows 端 `RAWMOUSE` 结构体此前多出一个 `ulButtons`、又少了 2 字节对齐填充，导致 `lLastX` 实际读到的是真实的 `lLastY`、`lLastY` 恒为 0 —— 表现为共享鼠标「只能在一条线上移动」。现按 `winuser.h` 修正布局（`Pack=4`，`lLastX@12 / lLastY@16`），加入布局自检与逐帧位移诊断，实测真实硬件帧双轴均有值。共享模式下「键盘」「鼠标」后还会实时显示当前生效的是哪台设备的键鼠（macOS / Windows），由持有屏幕的一端裁决并同步到对端。0.5.4 起 Windows 使用 Raw Input 硬件相对位移、Mac 注入器连续注入期间不回读光标。
 
 ---
 
@@ -16,13 +16,14 @@
 | 端口识别 | 检测输入端口类型（USB-C / DP / HDMI / VGA…），能识别所连主机时显示 macOS / Windows / Linux，识别不到留空 | 端口类型不需要；OS 名称需要 |
 | 自动发现 | 两端在局域网互报地址，Windows 自动连上 Mac，**无需配置 IP** | 依赖局域网广播 |
 | 键鼠共享 | 独立模式 / 共享模式，共享模式下可分别开关键盘与鼠标 | 依赖局域网 |
+| 当前设备显示 | 共享模式下「键盘」「鼠标」后实时标注当前生效的设备（macOS / Windows），两端同步 | 依赖局域网 |
 | 本地优先 | 两端同时操作时，本地键鼠优先，避免互相抢输入 | — |
 | 开机自启动 | 菜单中勾选控制，Mac 用系统登录项，Windows 用计划任务 + 看门狗 | — |
 | 热键 | `Ctrl+Alt+1` 切到 Mac、`Ctrl+Alt+2` 切到 Windows（Mac 上是 `⌃⌥1` / `⌃⌥2`） | — |
 
 明确不做：剪贴板同步、文件拖拽、光标无缝跨屏、音频跟随。
 
-> 共享鼠标使用 Windows **Raw Input** 的硬件相对位移，并按两端屏幕比例换算（4K 物理像素 → macOS 逻辑点）；不经过指针加速，也不受 DPI 虚拟化与光标回中影响。Raw Input 不可用时自动降级到低级钩子，并做同样的缩放与限幅。
+> 共享鼠标使用 Windows **Raw Input** 的硬件相对位移，并按两端屏幕比例换算（4K 物理像素 → macOS 逻辑点）；不经过指针加速，也不受 DPI 虚拟化与光标回中影响。结构体布局严格按 `winuser.h` 对齐并带运行时自检，避免只读到单轴位移。Raw Input 不可用时自动降级到低级钩子，并做同样的缩放与限幅。
 
 > 显示器完全不支持 DDC/CI 时，菜单只显示一行精简提示「该显示器不支持」，并禁用输入源项。支持时不会显示任何多余说明。
 
@@ -34,9 +35,9 @@
 
 | 文件 | 平台 | 说明 |
 |---|---|---|
-| `KVMBridge-0.5.4-mac.dmg` | macOS（Apple Silicon） | 拖入「应用程序」 |
-| `KVMBridge-0.5.4-mac.zip` | macOS（Apple Silicon） | 同上，zip 版 |
-| `KVMBridge-0.5.4-win.zip` | Windows 10 / 11 | 解压后直接运行 `KVMBridge.exe` |
+| `KVMBridge-0.5.5-mac.dmg` | macOS（Apple Silicon） | 拖入「应用程序」 |
+| `KVMBridge-0.5.5-mac.zip` | macOS（Apple Silicon） | 同上，zip 版 |
+| `KVMBridge-0.5.5-win.zip` | Windows 10 / 11 | 解压后直接运行 `KVMBridge.exe` |
 
 ### macOS 端
 1. 把 `KVMBridge.app` 拖进「应用程序」并运行，菜单栏出现图标。
@@ -53,6 +54,8 @@
 
 ### 两端连接后
 菜单显示「已连接」，端口后会标出所连系统（如 `USB-C · macOS`、`DisplayPort · Windows`）。网络异常时会给出具体原因（连接被拒绝 / 网络不可达 / 超时 / 防火墙 24801 / 心跳超时等）。
+
+共享模式下，「键盘」「鼠标」两行会实时显示当前生效的是哪台设备的键鼠，例如 `键盘 · macOS`、`鼠标 · Windows`；键盘与鼠标分别判定，谁在输入就显示谁，两端菜单始终一致。刚连上或切屏后默认显示持有屏幕那台设备的键鼠；切到独立模式或连接断开时标注自动清空。
 
 ---
 
@@ -99,7 +102,7 @@ windows/package/       Windows 端 C# 源码
                        （托盘、DDC、协议、钩子、自动发现、计划任务自启）
 vendor/m1ddc/          DDC/CI 命令行工具（源码 + 预编译 arm64 二进制）
 scripts/pack.sh        双端安装包打包脚本
-dist/                 0.5.4 可运行安装包
+dist/                 0.5.5 可运行安装包
 DESIGN.md             系统设计
 UI-SPEC.md            界面规格
 ```
@@ -124,7 +127,7 @@ UI-SPEC.md            界面规格
 ## 校验和（SHA-256）
 
 ```
-565de2219679ac7420cb913b09b0a66ebf6bbe130120adf14a26f2bae5928235  KVMBridge-0.5.4-mac.dmg
-83de03ed5e63b182a979047b607e344fc4a7fac1d971df97485c06c66539d6c4  KVMBridge-0.5.4-mac.zip
-bf48e764c716c7e114329d6874a8df51312f1fc15a31c24895f748af7aca5bd5  KVMBridge-0.5.4-win.zip
+483a0bb8724c8070bc2f8a8c095bb45f69ebde21b2f51f245db12f4591f41d64  KVMBridge-0.5.5-mac.dmg
+37d8d34ac229462bcf0eb74f8c63176c6a7b33ed67c4ce75b5fa7ac6e4c301b5  KVMBridge-0.5.5-mac.zip
+51810af5bbeab40d12c93e83c52484e86084670857e878f4910a79c821b557db  KVMBridge-0.5.5-win.zip
 ```

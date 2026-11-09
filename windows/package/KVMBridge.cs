@@ -533,6 +533,95 @@ namespace KvmBridge
         }
     }
 
+    // ── 鼠标链路逐帧诊断 ────────────────────────────────────────────────
+    /// 记录「硬件原始位移 → 缩放后位移 → 合并后发出的位移」三段累计量，
+    /// 用来核对整条链路有没有丢位移、有没有被重复缩放。
+    /// 逐帧明细只在 %TEMP%\kvm-mouse-diag.on 存在时写，常态只有几个整数加法。
+    internal static class MouseDiag
+    {
+        private static readonly object Gate = new object();
+        private static readonly List<string> Lines = new List<string>();
+        public static long RawX, RawY, ScaledX, ScaledY, SentX, SentY;
+        public static int RawN, ScaledN, SentN;
+        private static bool _enabled;
+        private static DateTime _nextCheck = DateTime.MinValue;
+
+        private static bool Enabled
+        {
+            get
+            {
+                try { return File.Exists(Path.Combine(Path.GetTempPath(), "kvm-mouse-diag.on")); }
+                catch { return false; }
+            }
+        }
+
+        private static void Append(string tag, int dx, int dy)
+        {
+            DateTime now = DateTime.Now;
+            if (now >= _nextCheck)
+            {
+                _enabled = Enabled;
+                _nextCheck = now.AddSeconds(2);
+            }
+            if (!_enabled) return;
+            lock (Gate)
+            {
+                if (Lines.Count > 400) Lines.RemoveRange(0, 200);
+                Lines.Add(DateTime.Now.ToString("HH:mm:ss.fff") + " " + tag
+                    + " " + dx + " " + dy);
+            }
+        }
+
+        public static void Raw(int dx, int dy)
+        {
+            RawX += dx; RawY += dy; RawN++;
+            Append("raw", dx, dy);
+        }
+
+        public static void Scaled(int dx, int dy)
+        {
+            ScaledX += dx; ScaledY += dy; ScaledN++;
+            Append("scl", dx, dy);
+        }
+
+        public static void Sent(int dx, int dy)
+        {
+            SentX += dx; SentY += dy; SentN++;
+            Append("snd", dx, dy);
+        }
+
+        public static void Reset()
+        {
+            lock (Gate)
+            {
+                RawX = RawY = ScaledX = ScaledY = SentX = SentY = 0;
+                RawN = ScaledN = SentN = 0;
+                Lines.Clear();
+                _enabled = Enabled;
+            }
+        }
+
+        public static string Sums()
+        {
+            return "raw=" + RawX + "," + RawY + "/" + RawN
+                + " scl=" + ScaledX + "," + ScaledY + "/" + ScaledN
+                + " snd=" + SentX + "," + SentY + "/" + SentN;
+        }
+
+        public static string Dump()
+        {
+            try
+            {
+                string p = Path.Combine(Path.GetTempPath(), "kvm-win-mouse.log");
+                string[] copy;
+                lock (Gate) copy = Lines.ToArray();
+                File.WriteAllLines(p, copy);
+                return p + " lines=" + copy.Length;
+            }
+            catch (Exception e) { return "dump failed: " + e.Message; }
+        }
+    }
+
     // ── 发送队列 ──────────────────────────────────────────────────────────
     /// 键鼠事件不能直接写 socket：钩子回调里做阻塞网络 IO 会撞上
     /// LowLevelHooksTimeout，系统会跳过甚至卸载钩子。
@@ -620,6 +709,7 @@ namespace KvmBridge
                 if (dx != 0 || dy != 0)
                 {
                     SentMoves++;
+                    MouseDiag.Sent(dx, dy);
                     _relay.Send("M " + dx + " " + dy);
                 }
             }
@@ -810,6 +900,8 @@ namespace KvmBridge
 
         public event Action<bool> ConnectionChanged;
         public event Action<string> ControlReceived;
+        /// 成功接收对端键鼠事件；Bool = 是否为指针类。用于显示当前生效设备。
+        public event Action<bool> PeerInput;
 
         private Stream _stream;
         private readonly object _writeLock = new object();
@@ -1036,8 +1128,10 @@ namespace KvmBridge
             // 控制报文交给上层流程，不要走键鼠注入
             if (verb == "ASK" || verb == "GO" || verb == "OK" || verb == "NO"
                 || verb == "MODE" || verb == "CAP" || verb == "PING" || verb == "PONG"
-                || verb == "OWNER" || verb == "OWNER?" || verb == "HELLO"
-                || verb == "LAT" || verb == "LATR")
+                 || verb == "OWNER" || verb == "OWNER?" || verb == "HELLO"
+                 || verb == "LAT" || verb == "LATR" || verb == "USE"
+                 || verb == "DIAGRESET" || verb == "DIAGDUMP" || verb == "SPEED"
+                 || verb == "PROBE")
             {
                 Action<string> handler = ControlReceived;
                 if (handler != null)
@@ -1053,6 +1147,13 @@ namespace KvmBridge
             // 本地输入不经网络，天然更快；丢弃远端才能避免两套输入互相打架。
             if (LocalInputActive(verb != "K")) { DroppedLocal++; return; }
             Injected++;
+
+            // 对端事件真的被接收了：由屏幕持有端据此裁决「当前用哪套键鼠」。
+            Action<bool> peerHandler = PeerInput;
+            if (peerHandler != null)
+            {
+                try { peerHandler(verb != "K"); } catch { }
+            }
 
             switch (verb)
             {
@@ -1139,16 +1240,25 @@ namespace KvmBridge
             public IntPtr wParam;
         }
 
-        [StructLayout(LayoutKind.Sequential)]
+        // winuser.h 的 RAWMOUSE 是：
+        //   USHORT usFlags;
+        //   union { ULONG ulButtons; struct { USHORT usButtonFlags; USHORT usButtonData; }; };
+        //   ULONG  ulExtraInformation;
+        //   LONG   lLastX;
+        //   LONG   lLastY;
+        // union 含 ULONG，需 4 字节对齐，所以 usFlags 后有 2 字节填充。
+        // 之前按「usFlags / usButtonFlags / usButtonData / ulExtra / ulButtons /
+        // lLastX / lLastY」平铺，多出一个 ulButtons 且少了填充，lLastX 实际
+        // 读到的是真实的 lLastY、lLastY 读到结构之后的垃圾（恒 0）——
+        // 表现就是「鼠标只能在一条线上移动」：垂直移动被当成水平位移。
+        [StructLayout(LayoutKind.Sequential, Pack = 4)]
         private struct RAWMOUSE
         {
-            public ushort usFlags;
-            public ushort usButtonFlags;
-            public ushort usButtonData;
-            public uint ulExtraInformation;
-            public uint ulButtons;
-            public int lLastX;
-            public int lLastY;
+            public ushort usFlags;            // @0
+            public uint ulButtons;            // @4（联合体，不读）
+            public uint ulExtraInformation;   // @8
+            public int lLastX;                // @12
+            public int lLastY;                // @16
         }
 
         [DllImport("user32.dll", SetLastError = true)]
@@ -1163,6 +1273,21 @@ namespace KvmBridge
         public static bool Registered;
         public static int Frames;
         public static int MaxDelta;
+
+        /// 结构体布局自检：偏移错了会静默变成单轴鼠标，必须能在状态里看到。
+        public static bool LayoutOk
+        {
+            get
+            {
+                try
+                {
+                    return Marshal.SizeOf(typeof(RAWMOUSE)) == 20
+                        && (int)Marshal.OffsetOf(typeof(RAWMOUSE), "lLastX") == 12
+                        && (int)Marshal.OffsetOf(typeof(RAWMOUSE), "lLastY") == 16;
+                }
+                catch { return false; }
+            }
+        }
 
         public static bool Live
         {
@@ -1379,6 +1504,9 @@ namespace KvmBridge
         }
 
         public static Action<int, int> OnKey;
+        /// 真实本机键鼠输入（不含 injected）；Bool = 是否为指针类。
+        /// 用于共享模式下显示「当前正在用哪套键鼠」，回调必须轻量。
+        public static Action<bool> OnRealInput;
         public static Action<int, int> OnMove;
         public static Action<int, int> OnButton;
         public static Action<int> OnWheel;
@@ -1393,6 +1521,21 @@ namespace KvmBridge
         private static double _scaleY = 1.0;
         private static double _accSX;
         private static double _accSY;
+        /// 手感倍率：硬件 count 与对端逻辑点之间的换算不是纯几何比例，
+        /// Windows 的「提高指针精确度」会让快速甩动被系统放大，而 Mac 端
+        /// 用绝对坐标注入没有加速。这个系数用于补偿，默认 1（纯尺寸比例）。
+        private static double _speed = 1.0;
+
+        public static void SetSpeed(double s)
+        {
+            if (s < 0.25 || s > 4.0) return;
+            lock (_scaleGate) { _speed = s; }
+        }
+
+        public static string SpeedText
+        {
+            get { lock (_scaleGate) { return _speed.ToString("0.##", CultureInfo.InvariantCulture); } }
+        }
 
         public static string ScaleText
         {
@@ -1430,8 +1573,8 @@ namespace KvmBridge
         {
             lock (_scaleGate)
             {
-                _accSX += dx * _scaleX;
-                _accSY += dy * _scaleY;
+                _accSX += dx * _scaleX * _speed;
+                _accSY += dy * _scaleY * _speed;
                 ox = (int)_accSX;
                 oy = (int)_accSY;
                 _accSX -= ox;
@@ -1443,9 +1586,11 @@ namespace KvmBridge
         public static void DispatchRawMove(int dx, int dy)
         {
             if (!_captureMouse) return;
+            MouseDiag.Raw(dx, dy);
             int ox;
             int oy;
             ScaleMove(dx, dy, out ox, out oy);
+            MouseDiag.Scaled(ox, oy);
             if (ox == 0 && oy == 0) return;
             Action<int, int> handler = OnMove;
             if (handler != null)
@@ -1572,6 +1717,8 @@ namespace KvmBridge
                 // 对端注入进来的按键不再二次处理，避免回环
                 if ((flags & LLKHF_INJECTED) == 0)
                 {
+                    Action<bool> real = OnRealInput;
+                    if (real != null) { try { real(false); } catch { } }
                     // 只有「没被截获」的真实键盘事件才算本机在活动
                     if (!_captureKeys)
                     {
@@ -1628,11 +1775,16 @@ namespace KvmBridge
             uint flags = 0;
             if (nCode >= 0) flags = (uint)Marshal.ReadInt32(lParam, MS_OFFSET_FLAGS);
 
-            if (nCode >= 0 && (flags & LLMHF_INJECTED) == 0 && !_captureMouse)
+            if (nCode >= 0 && (flags & LLMHF_INJECTED) == 0)
             {
-                int tick = Environment.TickCount;
-                LastRealInputTick = tick;
-                LastRealMouseTick = tick;
+                Action<bool> real = OnRealInput;
+                if (real != null) { try { real(true); } catch { } }
+                if (!_captureMouse)
+                {
+                    int tick = Environment.TickCount;
+                    LastRealInputTick = tick;
+                    LastRealMouseTick = tick;
+                }
             }
 
             if (nCode >= 0 && wParam.ToInt32() == WM_MOUSEMOVE)
@@ -2184,7 +2336,7 @@ namespace KvmBridge
         private const uint ES_SYSTEM_REQUIRED = 0x00000001;
         private const uint ES_DISPLAY_REQUIRED = 0x00000002;
 
-        private const string AppVersion = "0.5.4";
+        private const string AppVersion = "0.5.5";
 
         private static int[] Values { get { return Ddc.PortValues; } }
         private static string[] Names { get { return Ddc.PortNames; } }
@@ -2211,6 +2363,17 @@ namespace KvmBridge
         /// 对端自报的操作系统与所在输入源值；断线清空（识别不到时端口后面留空）
         private volatile string _peerOS = "";
         private volatile int _peerMyValue = -1;
+
+        /// 共享模式下当前生效的键鼠来自哪台设备（OS 名）。
+        /// 只由屏幕持有端裁决并广播，两端菜单显示一致。
+        private readonly object _useGate = new object();
+        private string _useKeyboardOS = "";
+        private string _useMouseOS = "";
+
+        private bool IsScreenOwner
+        {
+            get { return _ownerKnown && _ownerValue == SwitchFlow.MyValue; }
+        }
         /// 屏幕归属的显式状态。由切换结果决定，DDC 只用于初始化。
         /// 不能只靠 DDC：这块屏对非活动端口回的可能是它自己的值。
         private volatile bool _ownerKnown;
@@ -2347,12 +2510,28 @@ namespace KvmBridge
             _relay.ConnectionChanged += OnConnectionChanged;
             _relay.ControlReceived += OnControl;
 
+            _relay.PeerInput += delegate(bool pointer)
+            {
+                // 只有屏幕在本机时由本机裁决；对端事件说明当前用的是对端键鼠。
+                if (!_sharedMode || !IsScreenOwner) return;
+                string os = string.IsNullOrEmpty(_peerOS) ? "macOS" : _peerOS;
+                ApplyUse(pointer ? null : os, pointer ? os : null, true);
+            };
+
             // 键鼠事件先进队列，由独立线程发送；钩子回调里不做阻塞 IO
             _sender = new InputSender(_relay);
             InputHook.OnKey = delegate(int vk, int down) { _sender.Key(vk, down); };
             InputHook.OnMove = delegate(int dx, int dy) { _sender.Move(dx, dy); };
             InputHook.OnButton = delegate(int button, int down) { _sender.Button(button, down); };
             InputHook.OnWheel = delegate(int delta) { _sender.Wheel(delta); };
+
+            InputHook.OnRealInput += delegate(bool pointer)
+            {
+                // 本机真实输入；屏幕在对端时本机是转发方，由对端裁决后同步回来。
+                if (!_sharedMode || !IsScreenOwner || !_relay.Connected) return;
+                ApplyUse(pointer ? null : "Windows", pointer ? "Windows" : null, true);
+            };
+
             InputHook.Install();
 
             _flow = new SwitchFlow(_relay);
@@ -2408,6 +2587,7 @@ namespace KvmBridge
                 // 断线后不再知道对端系统，端口后面的系统标注要留空
                 _peerOS = "";
                 _peerMyValue = -1;
+                ClearUse();
                 // 断线必须立刻停止截获：否则键鼠被吞掉却送不出去，
                 // 用户会完全失去对这台机器的控制。
                 InputHook.SetCapture(false, false);
@@ -2415,6 +2595,7 @@ namespace KvmBridge
             }
             else
             {
+                ClearUse();   // 重连后重新裁决，不显示断线前的旧设备
                 // 连接刚建立时不要广播本机缓存的归属：它可能是断线前的旧值，
                 // 而这块屏对非活动端口会回自身端口号，DDC 读数不可信。
                 // 改为向 Mac 索取——Mac 的持久化值只由已确认的切换写入。
@@ -2464,6 +2645,28 @@ namespace KvmBridge
                 return;
             }
 
+            // 屏幕持有端裁决出的「当前正在用哪套键鼠」，两端实时同步显示。
+            if (line.StartsWith("USE "))
+            {
+                string useKb = "", useMs = "";
+                string[] up = line.Split(' ');
+                for (int i = 1; i < up.Length; i++)
+                {
+                    if (up[i].StartsWith("kb="))
+                    {
+                        string v = up[i].Substring(3);
+                        useKb = (v == "-" || v.Length == 0) ? "" : v;
+                    }
+                    else if (up[i].StartsWith("mouse="))
+                    {
+                        string v = up[i].Substring(6);
+                        useMs = (v == "-" || v.Length == 0) ? "" : v;
+                    }
+                }
+                ApplyUseFromPeer(useKb, useMs);
+                return;
+            }
+
             if (line.StartsWith("MODE "))
             {
                 string[] mp = line.Split(' ');
@@ -2475,6 +2678,7 @@ namespace KvmBridge
                 }
                 _relay.AcceptKeys = _shareKeyboard;
                 _relay.AcceptMouse = _shareMouse;
+                if (!_sharedMode) ClearUse();
                 UpdateCapture(_cachedInput);
                 if (_menu.IsHandleCreated)
                 {
@@ -2491,6 +2695,9 @@ namespace KvmBridge
                 {
                     _ownerKnown = true;
                     _ownerValue = v;
+                    // 屏幕切到本机：默认生效的是本机键鼠
+                    if (v == SwitchFlow.MyValue && _sharedMode)
+                        ApplyUse("Windows", "Windows", true);
                 }
                 UpdateCapture(_cachedInput);
                 return;
@@ -2522,6 +2729,41 @@ namespace KvmBridge
             if (line.StartsWith("LAT "))
             {
                 _relay.Send("LATR " + line.Substring(4));
+                return;
+            }
+
+            // ── 远程鼠标链路诊断（仅调试用，默认不触发）────────────────
+            if (line == "DIAGRESET") { MouseDiag.Reset(); return; }
+            if (line == "DIAGDUMP") { MouseDiag.Dump(); return; }
+            if (line.StartsWith("SPEED "))
+            {
+                double sp;
+                if (double.TryParse(line.Substring(6).Trim(), NumberStyles.Float,
+                                    CultureInfo.InvariantCulture, out sp)) InputHook.SetSpeed(sp);
+                return;
+            }
+            if (line.StartsWith("PROBE "))
+            {
+                // 模拟一串硬件相对位移，走与真实 Raw Input 完全相同的
+                // 缩放 → 合并 → 发送路径，用于端到端核对位移守恒。
+                string[] pp = line.Split(' ');
+                int n, pdx, pdy, gap;
+                if (pp.Length >= 5
+                    && int.TryParse(pp[1], out n) && int.TryParse(pp[2], out pdx)
+                    && int.TryParse(pp[3], out pdy) && int.TryParse(pp[4], out gap)
+                    && n > 0 && n <= 2000 && gap >= 0 && gap <= 1000)
+                {
+                    Thread probeThread = new Thread(new ThreadStart(delegate
+                    {
+                        for (int i = 0; i < n; i++)
+                        {
+                            InputHook.DispatchRawMove(pdx, pdy);
+                            if (gap > 0) Thread.Sleep(gap);
+                        }
+                    }));
+                    probeThread.IsBackground = true;
+                    probeThread.Start();
+                }
                 return;
             }
 
@@ -2569,6 +2811,7 @@ namespace KvmBridge
         private void SetMode(bool shared)
         {
             _sharedMode = shared;
+            if (!shared) ClearUse();
             SendMode();
             UpdateCapture(_cachedInput);
             RefreshState();
@@ -2670,6 +2913,72 @@ namespace KvmBridge
             _flow.Request(value);
         }
 
+        // ── 共享键鼠来源显示 ────────────────────────────────────────────
+        private static string UseItemTitle(string baseText, string os, bool shared, bool connected)
+        {
+            return (shared && connected && !string.IsNullOrEmpty(os))
+                ? baseText + " · " + os : baseText;
+        }
+
+        private void RefreshUseUI()
+        {
+            if (_menu != null && _menu.IsHandleCreated)
+            {
+                try { _menu.BeginInvoke(new Action(RefreshState)); } catch { }
+            }
+        }
+
+        /// 本机输入 / 对端注入导致来源变化；只有变化才刷新菜单并广播。
+        private void ApplyUse(string kb, string mouse, bool broadcast)
+        {
+            bool changed = false;
+            string nowKb, nowMouse;
+            lock (_useGate)
+            {
+                if (kb != null && _useKeyboardOS != kb) { _useKeyboardOS = kb; changed = true; }
+                if (mouse != null && _useMouseOS != mouse) { _useMouseOS = mouse; changed = true; }
+                nowKb = _useKeyboardOS;
+                nowMouse = _useMouseOS;
+            }
+            if (!changed) return;
+            RefreshUseUI();
+            if (broadcast && _relay.Connected)
+            {
+                _relay.Send("USE kb=" + (nowKb.Length == 0 ? "-" : nowKb)
+                    + " mouse=" + (nowMouse.Length == 0 ? "-" : nowMouse));
+            }
+        }
+
+        /// 收到持有端的裁决：原样同步（含清空），不回播，避免环路。
+        private void ApplyUseFromPeer(string kb, string mouse)
+        {
+            bool changed;
+            lock (_useGate)
+            {
+                changed = (_useKeyboardOS != kb || _useMouseOS != mouse);
+                _useKeyboardOS = kb;
+                _useMouseOS = mouse;
+            }
+            if (changed) RefreshUseUI();
+        }
+
+        private void ClearUse()
+        {
+            bool changed;
+            lock (_useGate)
+            {
+                changed = (_useKeyboardOS.Length > 0 || _useMouseOS.Length > 0);
+                _useKeyboardOS = "";
+                _useMouseOS = "";
+            }
+            if (changed) RefreshUseUI();
+        }
+
+        private string[] UseLabels()
+        {
+            lock (_useGate) { return new string[] { _useKeyboardOS, _useMouseOS }; }
+        }
+
         private void RefreshState()
         {
             // 勾选只认协议确认的归属：这块屏对非活动端口会回自身端口号，
@@ -2696,6 +3005,9 @@ namespace KvmBridge
             _autoStartItem.Checked = AutoStart.IsEnabled();
             _kbItem.Checked = _shareKeyboard;
             _mouseShareItem.Checked = _shareMouse;
+            string[] use = UseLabels();
+            _kbItem.Text = UseItemTitle("键盘", use[0], _sharedMode, connected);
+            _mouseShareItem.Text = UseItemTitle("鼠标", use[1], _sharedMode, connected);
             // 独立模式下键鼠子项整行隐藏（用 Available，不受菜单是否展开影响）
             _kbItem.Available = _sharedMode;
             _mouseShareItem.Available = _sharedMode;
@@ -2779,6 +3091,7 @@ namespace KvmBridge
         {
             try
             {
+                string[] use = UseLabels();
                 string s = "t=" + DateTime.Now.ToString("HH:mm:ss.fff")
                     + " ver=" + AppVersion
                     + " autostart=" + (AutoStart.IsEnabled() ? 1 : 0)
@@ -2788,6 +3101,8 @@ namespace KvmBridge
                     + " shared=" + (_sharedMode ? 1 : 0)
                     + " kb=" + (_shareKeyboard ? 1 : 0)
                     + " mouse=" + (_shareMouse ? 1 : 0)
+                    + " useKb=" + (use[0].Length > 0 ? use[0] : "-")
+                    + " useMouse=" + (use[1].Length > 0 ? use[1] : "-")
                     + " ownerKnown=" + (_ownerKnown ? 1 : 0)
                     + " owner=" + _ownerValue
                     + " capK=" + (InputHook.CaptureKeys ? 1 : 0)
@@ -2803,9 +3118,12 @@ namespace KvmBridge
                     + " jumps=" + InputHook.JumpsDropped
                     + " raw=" + (RawMouse.Live ? 1 : 0)
                     + " rawReg=" + (RawMouse.Registered ? 1 : 0)
+                    + " rawLayout=" + (RawMouse.LayoutOk ? 1 : 0)
                     + " rawFrames=" + RawMouse.Frames
                     + " rawMax=" + RawMouse.MaxDelta
                     + " scale=" + InputHook.ScaleText
+                    + " speed=" + InputHook.SpeedText
+                    + " diag=" + MouseDiag.Sums()
                     + " ddcw=" + (Ddc.WriteLog.Length == 0 ? "-" : Ddc.WriteLog)
                     + " sent=" + _sender.SentMoves
                     + " recv=" + _relay.Injected

@@ -40,6 +40,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private(set) var peerOS: String?
     private(set) var peerMyValue: Int?
 
+    // MARK: - 共享键鼠来源显示
+    /// 共享模式下，当前生效的键盘/鼠标来自哪台设备（用 OS 名标识）。
+    /// 只由「屏幕持有端」裁决并广播，两端菜单显示一致。
+    private let useLock = NSLock()
+    private var activeKeyboardOS: String?
+    private var activeMouseOS: String?
+
+    private var isScreenOwner: Bool { ownerValue == Ddc.myValue }
+
+    /// 供菜单与诊断读取：事件泵线程会写这两个值，必须加锁。
+    func useLabels() -> (kb: String?, mouse: String?) {
+        useLock.lock(); defer { useLock.unlock() }
+        return (activeKeyboardOS, activeMouseOS)
+    }
+
+    /// 本机真实输入 / 对端注入导致来源变化。只有真的变化才刷新菜单并广播。
+    private func setUse(kb: String?, mouse: String?, broadcast: Bool) {
+        useLock.lock()
+        var changed = false
+        if let k = kb, activeKeyboardOS != k { activeKeyboardOS = k; changed = true }
+        if let m = mouse, activeMouseOS != m { activeMouseOS = m; changed = true }
+        let snapshot = (activeKeyboardOS, activeMouseOS)
+        useLock.unlock()
+        guard changed else { return }
+        DispatchQueue.main.async { [weak self] in self?.refresh() }
+        if broadcast, RelayServer.shared.hasClient {
+            RelayServer.shared.sendLine("USE kb=\(snapshot.0 ?? "-") mouse=\(snapshot.1 ?? "-")")
+        }
+    }
+
+    /// 收到持有端的裁决结果：原样同步（含清空），不再回播，避免环路。
+    private func applyUseFromPeer(kb: String?, mouse: String?) {
+        useLock.lock()
+        let changed = (activeKeyboardOS != kb || activeMouseOS != mouse)
+        activeKeyboardOS = kb
+        activeMouseOS = mouse
+        useLock.unlock()
+        if changed { DispatchQueue.main.async { [weak self] in self?.refresh() } }
+    }
+
+    /// 断线 / 切到独立模式时清空，避免下次进入共享模式显示陈旧设备。
+    private func clearUse() {
+        useLock.lock()
+        let changed = (activeKeyboardOS != nil || activeMouseOS != nil)
+        activeKeyboardOS = nil
+        activeMouseOS = nil
+        useLock.unlock()
+        if changed { DispatchQueue.main.async { [weak self] in self?.refresh() } }
+    }
+
     private var displayKeeper: Process?
     private var cachedInput: Int?
     private var polling = false
@@ -218,6 +268,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         EventTapMonitor.shared.forwardKeyboard = shareKeyboard
         EventTapMonitor.shared.forwardMouse = shareMouse
 
+        // 本机真实键鼠输入：只有屏幕在本机时由本机裁决来源并广播给对端。
+        // 屏幕在对端时，本机是转发方，来源由对端（持有端）裁决后同步回来。
+        EventTapMonitor.shared.onLocalInput = { [weak self] pointer in
+            guard let self = self else { return }
+            guard self.mode == .shared, self.isScreenOwner,
+                  RelayServer.shared.hasClient else { return }
+            self.setUse(kb: pointer ? nil : "macOS",
+                        mouse: pointer ? "macOS" : nil,
+                        broadcast: true)
+        }
+
         setupRelay()
         // 局域网广播：让 Windows 端自动找到本机，不必手填 IP
         Discovery.shared.start()
@@ -327,6 +388,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(quit)
     }
 
+    /// 共享模式下在键盘/鼠标后面标出当前生效的是哪台设备的键鼠。
+    /// 独立模式、断线、尚无任何输入时保持纯标题，不显示误导性标注。
+    private func useItemTitle(_ base: String, os: String?) -> String {
+        guard mode == .shared, let os = os, RelayServer.shared.hasClient else { return base }
+        return base + " · " + os
+    }
+
     private func refresh() {
         // 勾选只认协议确认的归属；DDC 读数对非活动端口会说谎。
         let owner = ownerValue
@@ -343,6 +411,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         keyboardItem.state = shareKeyboard ? .on : .off
         mouseItem.state = shareMouse ? .on : .off
+        let use = useLabels()
+        keyboardItem.title = useItemTitle("键盘", os: use.kb)
+        mouseItem.title = useItemTitle("鼠标", os: use.mouse)
         autoStartItem.state = autoStartEnabled ? .on : .off
         // 独立模式下键鼠子项整行隐藏
         keyboardItem.isHidden = (mode != .shared)
@@ -428,6 +499,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch mode {
         case .independent:
             // 独立模式：任何情况下都不转发
+            clearUse()
             if EventTapMonitor.shared.forwarding {
                 EventTapMonitor.shared.forwarding = false
             }
@@ -524,6 +596,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        // 屏幕持有端裁决出的「当前正在用哪套键鼠」，两端实时同步显示。
+        if line.hasPrefix("USE ") {
+            var kb: String?
+            var ms: String?
+            for p in line.split(separator: " ").dropFirst() {
+                if p.hasPrefix("kb=") {
+                    let v = String(p.dropFirst(3))
+                    kb = (v == "-" || v.isEmpty) ? nil : v
+                } else if p.hasPrefix("mouse=") {
+                    let v = String(p.dropFirst(6))
+                    ms = (v == "-" || v.isEmpty) ? nil : v
+                }
+            }
+            applyUseFromPeer(kb: kb, mouse: ms)
+            return
+        }
+
         if line.hasPrefix("CAP ") {
             RelayServer.shared.peerCanInject = line.contains("inject=1")
             if !RelayServer.shared.peerCanInject {
@@ -566,6 +655,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 startForwarding()
             } else {
                 stopForwarding()
+            }
+            // 屏幕切回本机：默认生效的是本机键鼠
+            if value == Ddc.myValue, mode == .shared {
+                setUse(kb: "macOS", mouse: "macOS", broadcast: true)
             }
             return
         }
@@ -638,6 +731,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         injectedCount += 1
 
+        // 屏幕在本机、且成功注入了对端事件 → 当前生效的是对端那套键鼠。
+        // 键盘与鼠标分别记录；值没变时 setUse 会立即返回，不会每帧广播。
+        if isScreenOwner {
+            let os = peerOS ?? "Windows"
+            if line.hasPrefix("K ") {
+                setUse(kb: os, mouse: nil, broadcast: true)
+            } else {
+                setUse(kb: nil, mouse: os, broadcast: true)
+            }
+        }
+
         if line.hasPrefix("M ") {
             let now = Date()
             if firstInjectAt == .distantPast { firstInjectAt = now }
@@ -681,7 +785,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RelayServer.shared.onClientChange = { [weak self] connected in
             guard let self = self else { return }
             if connected {
+                self.clearUse()   // 重连后重新裁决，不显示断线前的旧设备
                 self.sendMode()
+                // 屏幕在本机时，默认生效的是本机键鼠，先给两端一个明确标注
+                if self.mode == .shared, self.isScreenOwner {
+                    self.setUse(kb: "macOS", mouse: "macOS", broadcast: true)
+                }
                 self.sendCapability()
                 RelayServer.shared.sendLine("HELLO os=macOS my=\(Ddc.myValue)")
                 if let v = self.ownerValue {
@@ -697,6 +806,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // 断线后不再知道对端系统，端口后面的系统标注要留空
                 self.peerOS = nil
                 self.peerMyValue = nil
+                self.clearUse()
                 // 转发中掉线必须立刻释放，否则输入被吃掉却送不出去
                 if EventTapMonitor.shared.forwarding {
                     self.stopForwarding()

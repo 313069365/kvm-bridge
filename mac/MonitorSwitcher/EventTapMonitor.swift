@@ -56,6 +56,11 @@ final class EventTapMonitor {
     var forwardMouse = true
     var onEmergencyRelease: (() -> Void)?
 
+    /// 真实本地输入（不含自己注入的）发生时通知上层，用于共享模式下
+    /// 在菜单里显示「当前正在用哪套键鼠」。Bool = 是否为指针类事件。
+    /// 回调在事件泵线程上高频触发，实现必须只做轻量比较。
+    var onLocalInput: ((Bool) -> Void)?
+
     private(set) var mouseMessages = 0
     private(set) var seenMoves = 0
     private(set) var seenKeys = 0
@@ -304,6 +309,7 @@ final class EventTapMonitor {
         lastLocalInput = now
         if pointer { lastLocalMouse = now }
         if keyboard { lastLocalKeyboard = now }
+        onLocalInput?(pointer)
 
         let keycode = event.getIntegerValueField(.keyboardEventKeycode)
         let flags = event.flags

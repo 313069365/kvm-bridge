@@ -209,6 +209,8 @@ final class DebugServer {
                 "peerOS=" + (app?.peerOS ?? "-"),
                 "kb=" + String(app?.shareKeyboard ?? true),
                 "mouse=" + String(app?.shareMouse ?? true),
+                "useKb=" + (app?.useLabels().kb ?? "-"),
+                "useMouse=" + (app?.useLabels().mouse ?? "-"),
                 "peerScreen=" + (app?.peerScreen.map(String.init) ?? "nil"),
                 "owner=" + (app?.ownerValue.map(String.init) ?? "nil"),
                 "client=\(RelayServer.shared.hasClient)",
