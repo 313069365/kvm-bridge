@@ -234,17 +234,13 @@ final class SwitchFlow {
 
     /// 对端已写入我的值，验证我是否真的拿到了画面
     private func onGo(_ value: Int) {
-        // CGCompleteDisplayConfiguration 会短暂中断 Mac 的视频输出。
-        // 切回时无条件连做两次重配，显示器就会两次报「无信号」并闪烁——
-        // 这恰恰是用户看到的故障，而不是修复手段。
-        // 正常切换只做无害的唤醒（caffeinate），绝不动显示模式；
-        // 只有确实读不到自己、怀疑显示管道挂起时才做强制重握手。
+        // CGCompleteDisplayConfiguration 每调用一次都会短暂切断 Mac 的视频输出，
+        // 显示器随即弹「无信号」并闪烁。它本是早期修黑屏的手段，但在切回路径上
+        // 本身就是闪烁源：DDC 验证偶尔慢一拍就会触发 series 连做两次重配。
+        // 现在彻底不做显示模式重配，只声明用户活跃（caffeinate，无害）。
+        // 读不到自己时如实回 NO，由发起端回滚，绝不主动打断视频输出。
         Ddc.wakeDisplay()
-        var ok = waitForOwnInput(seconds: 4)
-        if !ok {
-            DisplayKick.series([0.0, 1.5])
-            ok = waitForOwnInput(seconds: 6)
-        }
+        let ok = waitForOwnInput(seconds: 9)
 
         if ok {
             RelayServer.shared.sendLine("OK \(myValue)")
@@ -291,8 +287,9 @@ final class SwitchFlow {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
             if Ddc.readInput() == myValue { return true }
-            // 验证期间别把 I2C 打满：高频 DDC 读会干扰显示器刚建立的同步
-            Thread.sleep(forTimeInterval: 0.5)
+            // 切回瞬间 USB-C 链路正在重新训练，密集读 DDC 既读不到值，
+            // 又会持续占用 I2C 干扰显示器同步。放宽到 0.8s 一次。
+            Thread.sleep(forTimeInterval: 0.8)
         }
         return false
     }

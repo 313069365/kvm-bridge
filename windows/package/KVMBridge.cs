@@ -294,8 +294,26 @@ namespace KvmBridge
             return -1;
         }
 
+        /// 最近的 0x60 写操作，用于诊断「一次切屏是否被两端重复写」。
+        /// 重复写会让显示器在两个输入源之间来回跳并弹「无信号」。
+        private static readonly object _writeGate = new object();
+        private static readonly List<string> _writes = new List<string>();
+
+        public static string WriteLog
+        {
+            get
+            {
+                lock (_writeGate) { return string.Join(",", _writes.ToArray()); }
+            }
+        }
+
         public static void SetInput(int value)
         {
+            lock (_writeGate)
+            {
+                _writes.Add(DateTime.Now.ToString("HH:mm:ss.fff") + ":" + value);
+                if (_writes.Count > 24) _writes.RemoveAt(0);
+            }
             // 写 DDC 只在切屏时发生，频率极低，重建一次句柄保证有效。
             List<PHYSICAL_MONITOR> mons = Monitors(true);
             for (int i = 0; i < mons.Count; i++)
@@ -1090,6 +1108,167 @@ namespace KvmBridge
         }
     }
 
+    // ── 原始鼠标输入（Raw Input）─────────────────────────────────────────
+    /// 低级鼠标钩子给的是「已被指针加速、被屏幕边界钳制、受 DPI 虚拟化影响」的
+    /// 绝对屏幕坐标。相邻两帧做差时，快速甩动会因加速曲线被放大数倍，光标回中
+    /// 与坐标系切换还会叠加跳变 —— 转发到 Mac 就是「光标乱跳／位置不准」。
+    /// Raw Input 的 lLastX/lLastY 是鼠标硬件的相对位移，与光标位置、屏幕尺寸、
+    /// DPI、加速全部无关；Mac 端转发用的也正是这类相对位移，两端由此对称。
+    internal static class RawMouse
+    {
+        private const uint RIDEV_INPUTSINK = 0x00000100;
+        private const uint RID_INPUT = 0x10000003;
+        private const uint RIM_TYPEMOUSE = 0;
+        private const uint MOUSE_MOVE_ABSOLUTE = 0x0001;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RAWINPUTDEVICE
+        {
+            public ushort usUsagePage;
+            public ushort usUsage;
+            public uint dwFlags;
+            public IntPtr hwndTarget;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RAWINPUTHEADER
+        {
+            public uint dwType;
+            public uint dwSize;
+            public IntPtr hDevice;
+            public IntPtr wParam;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RAWMOUSE
+        {
+            public ushort usFlags;
+            public ushort usButtonFlags;
+            public ushort usButtonData;
+            public uint ulExtraInformation;
+            public uint ulButtons;
+            public int lLastX;
+            public int lLastY;
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] devices, uint count, uint size);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint GetRawInputData(IntPtr hRawInput, uint command,
+            IntPtr data, ref uint size, uint headerSize);
+
+        /// 注册成功且确实收到过硬件位移才启用；否则自动降级回钩子坐标差，
+        /// 保证在没有 Raw Input 权限/驱动的环境里鼠标不会完全失效。
+        public static bool Registered;
+        public static int Frames;
+        public static int MaxDelta;
+
+        public static bool Live
+        {
+            get { return Registered && Frames > 0; }
+        }
+
+        public static bool Register(IntPtr hwnd)
+        {
+            try
+            {
+                RAWINPUTDEVICE[] devices = new RAWINPUTDEVICE[1];
+                devices[0].usUsagePage = 0x01;   // Generic Desktop
+                devices[0].usUsage = 0x02;       // Mouse
+                devices[0].dwFlags = RIDEV_INPUTSINK;
+                devices[0].hwndTarget = hwnd;
+                uint size = (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE));
+                Registered = RegisterRawInputDevices(devices, 1, size);
+                return Registered;
+            }
+            catch
+            {
+                Registered = false;
+                return false;
+            }
+        }
+
+        /// 从 WM_INPUT 的 lParam 解析硬件相对位移。返回 false 表示该报文无有效位移。
+        public static bool Read(IntPtr lParam, out int dx, out int dy)
+        {
+            dx = 0;
+            dy = 0;
+            try
+            {
+                uint size = 0;
+                int headerSize = Marshal.SizeOf(typeof(RAWINPUTHEADER));
+                int mouseSize = Marshal.SizeOf(typeof(RAWMOUSE));
+                uint probe = GetRawInputData(lParam, RID_INPUT, IntPtr.Zero,
+                    ref size, (uint)headerSize);
+                if (probe == 0xFFFFFFFF || size < (uint)(headerSize + mouseSize) || size > 4096)
+                    return false;
+
+                IntPtr buf = Marshal.AllocHGlobal((int)size);
+                try
+                {
+                    uint got = GetRawInputData(lParam, RID_INPUT, buf,
+                        ref size, (uint)headerSize);
+                    if (got == 0xFFFFFFFF || got < (uint)(headerSize + mouseSize)) return false;
+
+                    RAWINPUTHEADER header = (RAWINPUTHEADER)Marshal.PtrToStructure(
+                        buf, typeof(RAWINPUTHEADER));
+                    if (header.dwType != RIM_TYPEMOUSE) return false;
+
+                    RAWMOUSE mouse = (RAWMOUSE)Marshal.PtrToStructure(
+                        new IntPtr(buf.ToInt64() + headerSize), typeof(RAWMOUSE));
+                    if ((mouse.usFlags & MOUSE_MOVE_ABSOLUTE) != 0) return false;
+
+                    dx = mouse.lLastX;
+                    dy = mouse.lLastY;
+                    if (dx == 0 && dy == 0) return false;
+                    Frames++;
+                    int peak = Math.Max(Math.Abs(dx), Math.Abs(dy));
+                    if (peak > MaxDelta) MaxDelta = peak;
+                    return true;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(buf);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+
+    /// 隐藏窗口：Raw Input 需要 hwndTarget 接收 WM_INPUT。
+    /// RIDEV_INPUTSINK 让它在不可见、无焦点时也能收到输入。
+    internal sealed class RawInputForm : Form
+    {
+        public RawInputForm()
+        {
+            ShowInTaskbar = false;
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            Location = new Point(-32000, -32000);
+            Size = new Size(1, 1);
+        }
+
+        protected override void SetVisibleCore(bool value)
+        {
+            base.SetVisibleCore(false);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == 0x00FF)   // WM_INPUT
+            {
+                int dx, dy;
+                if (RawMouse.Read(m.LParam, out dx, out dy))
+                    InputHook.DispatchRawMove(dx, dy);
+            }
+            base.WndProc(ref m);
+        }
+    }
+
     // ── 输入截获（共享模式下，屏幕在对端时把本机键鼠转过去）──────────────
     internal static class InputHook
     {
@@ -1206,6 +1385,76 @@ namespace KvmBridge
         /// 热键：参数是目标输入源（15 = Mac，16 = Windows）
         public static Action<int> OnHotkey;
 
+        // ── 位移缩放 ────────────────────────────────────────────────────
+        // Windows 4K 用物理像素（3840），macOS 用逻辑点（1920）。不换算时
+        // 同一段硬件位移在 Mac 上会走两倍距离，看起来就是「光标飞走」。
+        private static readonly object _scaleGate = new object();
+        private static double _scaleX = 1.0;
+        private static double _scaleY = 1.0;
+        private static double _accSX;
+        private static double _accSY;
+
+        public static string ScaleText
+        {
+            get
+            {
+                lock (_scaleGate)
+                {
+                    return _scaleX.ToString("0.###", CultureInfo.InvariantCulture)
+                        + "x" + _scaleY.ToString("0.###", CultureInfo.InvariantCulture);
+                }
+            }
+        }
+
+        /// 对端在 CAP 里上报自己的屏幕逻辑尺寸，据此换算出位移比例。
+        public static void SetPeerScreen(int width, int height)
+        {
+            if (width <= 0 || height <= 0) return;
+            int mineW = GetSystemMetrics(SM_CXSCREEN);
+            int mineH = GetSystemMetrics(SM_CYSCREEN);
+            if (mineW <= 0 || mineH <= 0) return;
+            double sx = (double)width / mineW;
+            double sy = (double)height / mineH;
+            // 只接受量级合理的比例，避免异常 CAP 把鼠标变得完全不可用
+            if (sx < 0.2 || sx > 5.0 || sy < 0.2 || sy > 5.0) return;
+            lock (_scaleGate)
+            {
+                _scaleX = sx;
+                _scaleY = sy;
+            }
+        }
+
+        /// 按两端屏幕尺度换算位移。小数部分留到下一帧累加，
+        /// 慢速移动不会被整数截断成「不动」。Raw Input 与降级路径共用。
+        public static void ScaleMove(int dx, int dy, out int ox, out int oy)
+        {
+            lock (_scaleGate)
+            {
+                _accSX += dx * _scaleX;
+                _accSY += dy * _scaleY;
+                ox = (int)_accSX;
+                oy = (int)_accSY;
+                _accSX -= ox;
+                _accSY -= oy;
+            }
+        }
+
+        /// Raw Input 送来的硬件相对位移：缩放后按 4ms 合并窗口转发出去。
+        public static void DispatchRawMove(int dx, int dy)
+        {
+            if (!_captureMouse) return;
+            int ox;
+            int oy;
+            ScaleMove(dx, dy, out ox, out oy);
+            if (ox == 0 && oy == 0) return;
+            Action<int, int> handler = OnMove;
+            if (handler != null)
+            {
+                MovesSent++;
+                try { handler(ox, oy); } catch { }
+            }
+        }
+
         private static IntPtr _kbHook = IntPtr.Zero;
         private static IntPtr _mouseHook = IntPtr.Zero;
         private static HookProc _kbProc;
@@ -1257,6 +1506,20 @@ namespace KvmBridge
             _pressedKeys.Clear();
             _pressedButtons.Clear();
             if (center) SetCursorPos(_centerX, _centerY);
+        }
+
+        /// 光标接近屏幕边缘时拉回中心，避免被系统边界钳制。
+        /// Raw Input 模式下只影响本机指针可见位置，不再参与位移计算。
+        private static void MaybeRecenter(int x, int y)
+        {
+            if (x < RecenterMargin || y < RecenterMargin
+                || x > _screenW - RecenterMargin
+                || y > _screenH - RecenterMargin)
+            {
+                _lastX = _centerX;
+                _lastY = _centerY;
+                SetCursorPos(_centerX, _centerY);
+            }
         }
 
         /// 结束时把还按着的键补发松开，交给对端执行
@@ -1389,6 +1652,16 @@ namespace KvmBridge
                         int x = Marshal.ReadInt32(lParam, MS_OFFSET_X);
                         int y = Marshal.ReadInt32(lParam, MS_OFFSET_Y);
 
+                        // Raw Input 生效时，鼠标位移已由硬件相对位移单独送达
+                        // DispatchRawMove。这里只负责吞掉事件（防止本机误操作）
+                        // 和把光标拉回可见区域，绝不再用屏幕绝对坐标做差 ——
+                        // 那个差值被指针加速与坐标系污染，是「乱跳」的来源。
+                        if (RawMouse.Live)
+                        {
+                            MaybeRecenter(x, y);
+                            return (IntPtr)1;
+                        }
+
                         int dx = x - _lastX;
                         int dy = y - _lastY;
                         _lastX = x;
@@ -1408,25 +1681,29 @@ namespace KvmBridge
 
                         if (dx != 0 || dy != 0)
                         {
-                            Action<int, int> handler = OnMove;
-                            if (handler != null)
+                            // 降级路径同样要做两件事：压住指针加速造成的超大单帧
+                            // 位移、按两端屏幕尺度换算。少了这两步，4K 物理像素
+                            // 直接当 Mac 逻辑点用，快速甩动时光标就会飞出去。
+                            const int cap = 120;
+                            if (dx > cap) dx = cap; else if (dx < -cap) dx = -cap;
+                            if (dy > cap) dy = cap; else if (dy < -cap) dy = -cap;
+                            int sx, sy;
+                            ScaleMove(dx, dy, out sx, out sy);
+                            if (sx != 0 || sy != 0)
                             {
-                                MovesSent++;
-                                try { handler(dx, dy); } catch { }
+                                Action<int, int> handler = OnMove;
+                                if (handler != null)
+                                {
+                                    MovesSent++;
+                                    try { handler(sx, sy); } catch { }
+                                }
                             }
                         }
 
                         // 只在接近屏幕边缘时把指针拉回中心。
                         // 每次移动都回中会在系统输入关键路径上多做一次光标定位，
                         // 高频鼠标下就是肉眼可见的卡顿。
-                        if (x < RecenterMargin || y < RecenterMargin
-                            || x > _screenW - RecenterMargin
-                            || y > _screenH - RecenterMargin)
-                        {
-                            _lastX = _centerX;
-                            _lastY = _centerY;
-                            SetCursorPos(_centerX, _centerY);
-                        }
+                        MaybeRecenter(x, y);
                         return (IntPtr)1;
                     }
 
@@ -1907,7 +2184,7 @@ namespace KvmBridge
         private const uint ES_SYSTEM_REQUIRED = 0x00000001;
         private const uint ES_DISPLAY_REQUIRED = 0x00000002;
 
-        private const string AppVersion = "0.5.3";
+        private const string AppVersion = "0.5.4";
 
         private static int[] Values { get { return Ddc.PortValues; } }
         private static string[] Names { get { return Ddc.PortNames; } }
@@ -2222,6 +2499,22 @@ namespace KvmBridge
             if (line.StartsWith("CAP "))
             {
                 _relay.PeerCanInject = line.IndexOf("inject=1") >= 0;
+                // 对端上报屏幕逻辑尺寸，用于把硬件相对位移按两端尺度换算。
+                string[] fields = line.Split(' ');
+                for (int i = 1; i < fields.Length; i++)
+                {
+                    if (!fields[i].StartsWith("scr=")) continue;
+                    string[] wh = fields[i].Substring(4).Split('x');
+                    int pw, ph;
+                    if (wh.Length == 2
+                        && int.TryParse(wh[0], NumberStyles.Integer,
+                            CultureInfo.InvariantCulture, out pw)
+                        && int.TryParse(wh[1], NumberStyles.Integer,
+                            CultureInfo.InvariantCulture, out ph))
+                    {
+                        InputHook.SetPeerScreen(pw, ph);
+                    }
+                }
                 UpdateCapture(_cachedInput);
                 return;
             }
@@ -2508,6 +2801,12 @@ namespace KvmBridge
                     + " seen=" + InputHook.MouseSeen
                     + " moves=" + InputHook.MovesSent
                     + " jumps=" + InputHook.JumpsDropped
+                    + " raw=" + (RawMouse.Live ? 1 : 0)
+                    + " rawReg=" + (RawMouse.Registered ? 1 : 0)
+                    + " rawFrames=" + RawMouse.Frames
+                    + " rawMax=" + RawMouse.MaxDelta
+                    + " scale=" + InputHook.ScaleText
+                    + " ddcw=" + (Ddc.WriteLog.Length == 0 ? "-" : Ddc.WriteLog)
                     + " sent=" + _sender.SentMoves
                     + " recv=" + _relay.Injected
                     + " drop=" + _relay.DroppedLocal
@@ -2583,6 +2882,11 @@ namespace KvmBridge
                         AutoStart.Apply(AutoStart.IsEnabled());
                     });
                     Application.EnableVisualStyles();
+                    // 隐藏窗口只用于接收 WM_INPUT。句柄创建后立即注册 Raw Input；
+                    // 注册失败或收不到硬件位移时，InputHook 自动降级回钩子坐标差。
+                    RawInputForm rawSink = new RawInputForm();
+                    IntPtr rawHwnd = rawSink.Handle;
+                    RawMouse.Register(rawHwnd);
                     TrayContext tray = new TrayContext(host, port);
                     Action<string> onMac = delegate(string ip)
                     {
@@ -2595,6 +2899,7 @@ namespace KvmBridge
                     string seen = disc.LastMacIp;
                     if (!string.IsNullOrEmpty(seen)) onMac(seen);
                     Application.Run(tray);
+                    GC.KeepAlive(rawSink);   // 别让隐藏窗口在消息循环期间被回收
                 }
             }
             finally

@@ -129,6 +129,32 @@ final class DebugServer {
             return String(format: "cursor=(%.0f,%.0f)", pos.x, pos.y)
         }
 
+        // ddclog：列出最近的 DDC 0x60 写操作，用来确认一次切屏只有一次写、两端没有互写
+        if text == "ddclog" {
+            let log = Ddc.writeLog
+            return log.isEmpty ? "no writes" : log
+        }
+
+        // injectburst <帧数> <dx> <dy> <间隔微秒>：连续注入，回报起止光标。
+        // 用来验证「连续注入期间不回读系统光标」后位移是线性的、不会跳回旧位置。
+        if text.hasPrefix("injectburst ") {
+            let p = text.split(separator: " ").map(String.init)
+            let n = min(max(p.count > 1 ? (Int(p[1]) ?? 0) : 0, 0), 500)
+            let dx = p.count > 2 ? (Int(p[2]) ?? 0) : 0
+            let dy = p.count > 3 ? (Int(p[3]) ?? 0) : 0
+            let gap = p.count > 4 ? (Int(p[4]) ?? 0) : 0
+            let start = CGEvent(source: nil)?.location ?? .zero
+            for _ in 0..<n {
+                Injector.mouseMove(dx: dx, dy: dy)
+                if gap > 0 { usleep(UInt32(gap)) }
+            }
+            usleep(150000)   // 等异步 CGEventPost 落地
+            let end = CGEvent(source: nil)?.location ?? .zero
+            return String(format: "start=(%.0f,%.0f) end=(%.0f,%.0f) expect=(%.0f,%.0f) n=%d",
+                          start.x, start.y, end.x, end.y,
+                          start.x + CGFloat(dx * n), start.y + CGFloat(dy * n), n)
+        }
+
         // menu：输出菜单结构，便于自动化验证布局（无需截图）
         if text == "menu" {
             let app = NSApplication.shared.delegate as? AppDelegate
@@ -187,6 +213,8 @@ final class DebugServer {
                 "owner=" + (app?.ownerValue.map(String.init) ?? "nil"),
                 "client=\(RelayServer.shared.hasClient)",
                 "discWin=" + (Discovery.shared.peerIP.isEmpty ? "-" : Discovery.shared.peerIP),
+                "scr=\(Int(CGDisplayBounds(CGMainDisplayID()).width))x\(Int(CGDisplayBounds(CGMainDisplayID()).height))",
+                "ddcw=" + (Ddc.writeLog.isEmpty ? "-" : Ddc.writeLog),
                 "peerCap=\(RelayServer.shared.peerCanInject)",
                 "injected=\(app?.injectedCount ?? 0)",
                 "dropped=\(app?.droppedCount ?? 0)",

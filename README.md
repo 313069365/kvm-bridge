@@ -2,9 +2,9 @@
 
 让一台显示器和一套键鼠在 **macOS** 与 **Windows** 两台主机之间共用。两端程序完全对等，任意一端都能切换屏幕、切换键鼠模式。
 
-当前版本：**0.5.3**
+当前版本：**0.5.4**
 
-0.5.3 修复：切回 Mac 时不再无条件重配显示模式（该操作会短暂中断视频输出，造成「无信号」闪烁）；两端静止时不再轮询 DDC，避免占用显示器 I2C；Windows 端声明 DPI 感知并拦截光标回中产生的伪位移（光标乱跳）；Mac 端把注入坐标夹在屏幕边界内，避免贴边后内部坐标漂移。
+0.5.4 修复：Windows 端改用 **Raw Input 硬件相对位移**替代被指针加速／DPI／屏幕边界污染的绝对坐标差，并按两端屏幕尺度换算；Mac 注入器连续注入期间不再回读异步滞后的系统光标（消除光标跳回旧位置）；切回路径彻底移除显示模式重配。0.5.3 起两端静止时不再轮询 DDC，切屏每次只写一次 `0x60`。
 
 ---
 
@@ -22,6 +22,8 @@
 
 明确不做：剪贴板同步、文件拖拽、光标无缝跨屏、音频跟随。
 
+> 共享鼠标使用 Windows **Raw Input** 的硬件相对位移，并按两端屏幕比例换算（4K 物理像素 → macOS 逻辑点）；不经过指针加速，也不受 DPI 虚拟化与光标回中影响。Raw Input 不可用时自动降级到低级钩子，并做同样的缩放与限幅。
+
 > 显示器完全不支持 DDC/CI 时，菜单只显示一行精简提示「该显示器不支持」，并禁用输入源项。支持时不会显示任何多余说明。
 
 ---
@@ -32,9 +34,9 @@
 
 | 文件 | 平台 | 说明 |
 |---|---|---|
-| `KVMBridge-0.5.3-mac.dmg` | macOS（Apple Silicon） | 拖入「应用程序」 |
-| `KVMBridge-0.5.3-mac.zip` | macOS（Apple Silicon） | 同上，zip 版 |
-| `KVMBridge-0.5.3-win.zip` | Windows 10 / 11 | 解压后直接运行 `KVMBridge.exe` |
+| `KVMBridge-0.5.4-mac.dmg` | macOS（Apple Silicon） | 拖入「应用程序」 |
+| `KVMBridge-0.5.4-mac.zip` | macOS（Apple Silicon） | 同上，zip 版 |
+| `KVMBridge-0.5.4-win.zip` | Windows 10 / 11 | 解压后直接运行 `KVMBridge.exe` |
 
 ### macOS 端
 1. 把 `KVMBridge.app` 拖进「应用程序」并运行，菜单栏出现图标。
@@ -97,7 +99,7 @@ windows/package/       Windows 端 C# 源码
                        （托盘、DDC、协议、钩子、自动发现、计划任务自启）
 vendor/m1ddc/          DDC/CI 命令行工具（源码 + 预编译 arm64 二进制）
 scripts/pack.sh        双端安装包打包脚本
-dist/                 0.5.3 可运行安装包
+dist/                 0.5.4 可运行安装包
 DESIGN.md             系统设计
 UI-SPEC.md            界面规格
 ```
@@ -115,13 +117,14 @@ UI-SPEC.md            界面规格
 - 显示器待机后无信号，两端都提供「保持显示器唤醒」。
 - 自研 TCP 协议**无鉴权、无加密**，任何能访问 Mac `24801` 端口的人都能注入输入，请只在可信局域网使用。
 - 部分显示器不上报 MCCS capability string，此时使用内置端口表；本机型实测 `USB-C=15 / DP=16 / HDMI1=17 / HDMI2=18`。
+- **切换时显示器偶发「无信号」提示**：软件侧已移除所有会短暂中断视频输出的操作（显示模式重配、后台 DDC 轮询），并用 DDC 写日志确认每次切换只写一次 `0x60`、两端不会互写。若提示仍在，通常是显示器 OSD 的「自动信号源检测 / Auto Source」在扫描没有信号的端口——请在显示器菜单中把信号源选择改为**手动 / 关闭自动检测**。用显示器物理按键直接切源也会出现同样提示，即可确认与软件无关。
 
 ---
 
 ## 校验和（SHA-256）
 
 ```
-14804c1e2482c1e9ad35d24877013fed5d40d67f4f6b60360e4fc3028ee1566e  KVMBridge-0.5.3-mac.dmg
-89b797f215c25cbe1d9666a62d0b5cdc69454e0422e79ed6021004f730aa0cb5  KVMBridge-0.5.3-mac.zip
-c958aa55fbf244ae066191ab2b91d55d1ae967367dc0006fb6b6a736cb2a0246  KVMBridge-0.5.3-win.zip
+565de2219679ac7420cb913b09b0a66ebf6bbe130120adf14a26f2bae5928235  KVMBridge-0.5.4-mac.dmg
+83de03ed5e63b182a979047b607e344fc4a7fac1d971df97485c06c66539d6c4  KVMBridge-0.5.4-mac.zip
+bf48e764c716c7e114329d6874a8df51312f1fc15a31c24895f748af7aca5bd5  KVMBridge-0.5.4-win.zip
 ```

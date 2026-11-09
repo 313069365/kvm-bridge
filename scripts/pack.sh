@@ -6,7 +6,7 @@
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VER="0.5.3"
+VER="0.5.4"
 DIST="$ROOT/dist"
 WIN="$ROOT/build/win"
 MACAPP="$ROOT/mac/MonitorSwitcher/KVMBridge.app"
@@ -25,7 +25,7 @@ cp "$WIN/KVMBridge.exe" "$TMP/win/"
 cp "$ROOT/windows/package/app.ico" "$TMP/win/"
 
 cat > "$TMP/mac/README-macOS.txt" <<'EOF'
-KVM Bridge 0.5.3 — macOS 端
+KVM Bridge 0.5.4 — macOS 端
 
 【安装】
 把 KVMBridge.app 拖进「应用程序」，双击运行，菜单栏会出现图标。
@@ -57,7 +57,7 @@ Ctrl+Option+1 切到 Mac，Ctrl+Option+2 切到 Windows。
 EOF
 
 cat > "$TMP/win/README-Windows.txt" <<'EOF'
-KVM Bridge 0.5.3 — Windows 端
+KVM Bridge 0.5.4 — Windows 端
 
 【运行】
 解压到任意文件夹（建议路径不含空格），双击 KVMBridge.exe。

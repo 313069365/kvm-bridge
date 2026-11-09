@@ -504,10 +504,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RelayServer.shared.sendLine("MODE \(mode.rawValue) kb=\(kb) mouse=\(ms)")
     }
 
-    /// 本机能否注入键鼠（与事件泵同一个辅助功能权限）
+    /// 本机能否注入键鼠（与事件泵同一个辅助功能权限）。
+    /// 顺带上报屏幕逻辑尺寸：Windows 4K 是物理像素，Mac 是逻辑点，
+    /// 对端据此把相对位移按比例换算，避免 2x 尺度差造成「光标飞走」。
     private func sendCapability() {
         let ok = EventTapMonitor.shared.isTrusted
-        RelayServer.shared.sendLine("CAP inject=\(ok ? 1 : 0)")
+        let bounds = CGDisplayBounds(CGMainDisplayID())
+        let w = Int(bounds.width), h = Int(bounds.height)
+        RelayServer.shared.sendLine("CAP inject=\(ok ? 1 : 0) scr=\(w)x\(h)")
     }
 
     // MARK: - 对端消息

@@ -15,9 +15,11 @@ enum Injector {
     private static var flags: CGEventFlags = []
     private static var pressedKeys: [UInt16: Bool] = [:]
 
-    /// 自己维护光标位置：每个移动事件都去查一次系统光标会创建临时 CGEvent，
-    /// 高频下是可见的开销。以下三种情况必须重新对齐，否则远端鼠标会「跳回旧位置」：
-    /// ① 空闲 300ms 以上；② 本机刚有过真实鼠标输入；③ 缓存跑出了屏幕边界。
+    /// 自己维护光标位置：连续注入期间绝不回读系统光标。
+    /// CGEventPost 是异步的，post 之后立刻读 CGEvent(source:nil).location 拿到的
+    /// 往往是「上一帧甚至更早」的位置；如果每帧都据此重算基准，光标就会在两个
+    /// 位置之间来回跳 —— 这正是 Windows 共享鼠标「乱跳／位置不准」的根因。
+    /// 只在注入流重新开始（空闲 300ms 以上）时对齐一次，此时异步事件早已落地。
     private static var cursor: CGPoint?
     private static var lastMoveAt = Date.distantPast
 
@@ -70,10 +72,11 @@ enum Injector {
         guard dx != 0 || dy != 0 else { return }
 
         let now = Date()
-        // 本机用户碰了 Mac 上的真实鼠标后，缓存的虚拟坐标已经失效。
-        // 注入事件带 tag，不会更新 lastLocalMouse，所以这里不会自己触发自己。
-        let touchedLocally = EventTapMonitor.shared.lastLocalMouse > lastMoveAt
-        if cursor == nil || touchedLocally || now.timeIntervalSince(lastMoveAt) > 0.3 {
+        // 只在一轮连续注入的起点对齐。不要因为「本机刚有过真实鼠标输入」就
+        // 立刻重对齐：Mac 上接了物理鼠标时该条件几乎每帧都成立，等于每帧都
+        // 拿滞后的系统光标覆盖缓存，光标必然抖动。空闲 300ms 后自然会对齐，
+        // 本机优先由 injectFromPeer 的仲裁负责（本地动则丢弃远端事件）。
+        if cursor == nil || now.timeIntervalSince(lastMoveAt) > 0.3 {
             if let pos = CGEvent(source: nil)?.location { cursor = clamp(pos) }
         }
         lastMoveAt = now
@@ -90,12 +93,12 @@ enum Injector {
     }
 
     static func mouseButton(_ button: Int, down: Bool) {
-        // 点击必须落在真实光标上：本机用户刚移动过鼠标就重新对齐，
-        // 否则会在旧位置误点。
-        if EventTapMonitor.shared.lastLocalMouse > lastMoveAt {
+        // 点击落在最后一次注入的位置上。这里同样不能即时回读系统光标：
+        // 异步 post 会让读到的是旧位置，结果就是「点到了刚才的地方」。
+        if cursor == nil {
             if let pos = CGEvent(source: nil)?.location { cursor = clamp(pos) }
         }
-        guard let current = cursor ?? CGEvent(source: nil)?.location else { return }
+        guard let current = cursor else { return }
         let type: CGEventType
         let cgButton: CGMouseButton
         if button == 2 {

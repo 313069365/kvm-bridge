@@ -172,7 +172,24 @@ enum Ddc {
         return ok ? v : nil
     }
 
+    /// 最近若干次 DDC 写操作。只用于诊断「切屏时两端是否互相重复写 0x60」，
+    /// 重复写会让显示器在两个输入源之间来回跳并弹「无信号」。
+    private static let writeGate = NSLock()
+    private static var _writes: [String] = []
+    private static let writeStamp: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss.SSS"; return f
+    }()
+
+    static var writeLog: String {
+        writeGate.lock(); defer { writeGate.unlock() }
+        return _writes.joined(separator: ",")
+    }
+
     static func setInput(_ value: Int) {
+        writeGate.lock()
+        _writes.append("\(writeStamp.string(from: Date())):\(value)")
+        if _writes.count > 24 { _writes.removeFirst() }
+        writeGate.unlock()
         _ = run(["set", "input", String(value)])
     }
 
