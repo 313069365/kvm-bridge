@@ -537,12 +537,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if !EventTapMonitor.shared.forwarding {
+            EventTapMonitor.shared.passThrough = true
             EventTapMonitor.shared.forwarding = true
             EventTapMonitor.shared.beginCapture()
         }
     }
 
     private func stopForwarding() {
+        EventTapMonitor.shared.passThrough = false
         if EventTapMonitor.shared.forwarding {
             EventTapMonitor.shared.forwarding = false
             EventTapMonitor.shared.endCapture()
@@ -641,12 +643,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if line == "OWNER?" {
             if let v = ownerValue {
                 RelayServer.shared.sendLine("OWNER \(v)")
+            } else {
+                RelayServer.shared.sendLine("OWNER -")
             }
             return
         }
 
         if line.hasPrefix("OWNER ") {
-            let raw = String(line.dropFirst(6))
+            let raw = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+            if raw == "-" {
+                ownerValue = nil
+                peerScreen = nil
+                stopForwarding()
+                Injector.releaseAll()
+                clearUse()
+                refresh()
+                return
+            }
             guard let value = Int(raw) else { return }
             peerScreen = value
             ownerValue = value
@@ -795,6 +808,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 RelayServer.shared.sendLine("HELLO os=macOS my=\(Ddc.myValue)")
                 if let v = self.ownerValue {
                     RelayServer.shared.sendLine("OWNER \(v)")
+                } else {
+                    RelayServer.shared.sendLine("OWNER -")
                 }
                 // 对端刚连上，如果屏幕本来就在它那边，直接交出键鼠。
                 // ownerValue 只由「已确认的切换」或已确认的对端广播写入，
@@ -852,6 +867,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 归属未确认（典型场景：对端离线时的盲切）时，既不写持久化缓存，
         // 也不向对端广播——不能把一个没有验证过的值扩散成两端共识。
         if case .unknown = owner {
+            // 归属不再可信：清掉持久化缓存并广播「未知」，让对端也释放
+            // 本机键鼠。否则对端会沿用旧归属继续吞掉本地输入，
+            // 表现为「有画面但鼠标完全不动」。
+            ownerValue = nil
+            peerScreen = nil
+            RelayServer.shared.sendLine("OWNER -")
             stopForwarding()
             Injector.releaseAll()
             sendCapability()

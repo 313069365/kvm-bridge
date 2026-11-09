@@ -54,6 +54,8 @@ final class EventTapMonitor {
     /// 共享模式下按类别开关，便于逐项排查
     var forwardKeyboard = true
     var forwardMouse = true
+    /// 转发的同时把本机事件放行（与 Windows 端对等），避免本机键鼠被吞掉。
+    var passThrough = false
     var onEmergencyRelease: (() -> Void)?
 
     /// 真实本地输入（不含自己注入的）发生时通知上层，用于共享模式下
@@ -351,7 +353,7 @@ final class EventTapMonitor {
                         write("\(stamp()) FORWARD vk=0x\(String(format: "%02X", vk)) down=\(down ? 1 : 0)")
                     }
                 }
-                return nil
+                return passThrough ? Unmanaged.passUnretained(event) : nil
 
             case .flagsChanged:
                 // 修饰键在 macOS 上是 .flagsChanged，不是 keyDown/keyUp。
@@ -363,7 +365,7 @@ final class EventTapMonitor {
                     trackKey(keycode, down: down)
                     RelayServer.shared.sendLine("K \(vk) \(down ? 1 : 0)")
                 }
-                return nil
+                return passThrough ? Unmanaged.passUnretained(event) : nil
 
             default:
                 break
@@ -386,7 +388,7 @@ final class EventTapMonitor {
                 pendingDY += dy
                 pendingLock.unlock()
             }
-            return nil
+            return passThrough ? Unmanaged.passUnretained(event) : nil
         }
 
         if forwarding && forwardMouse && (type == .leftMouseDown || type == .leftMouseUp
@@ -409,13 +411,13 @@ final class EventTapMonitor {
             }
             if down { pressedButtons.insert(button) } else { pressedButtons.remove(button) }
             RelayServer.shared.sendLine("B \(button) \(down ? 1 : 0)")
-            return nil
+            return passThrough ? Unmanaged.passUnretained(event) : nil
         }
 
         if forwarding && forwardMouse && type == .scrollWheel {
             let delta = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
             RelayServer.shared.sendLine("W \(delta)")
-            return nil
+            return passThrough ? Unmanaged.passUnretained(event) : nil
         }
 
         if capturing {

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -1512,6 +1512,8 @@ namespace KvmBridge
 
         private static volatile bool _captureKeys;
         private static volatile bool _captureMouse;
+        /// 归属未知时：仍然转发，但把本机输入放行，绝不吞掉。
+        private static volatile bool _passThroughLocal;
 
         /// 任一类被截获
         public static bool AnyCapture
@@ -1557,8 +1559,19 @@ namespace KvmBridge
             _captureMouse = mouse;
             bool now = keys || mouse;
 
-            if (!was && now) { SwitchCount++; BeginCapture(mouse); }
+            if (!was && now) { SwitchCount++; BeginCapture(mouse && !_passThroughLocal); }
             else if (was && !now) { SwitchCount++; EndCapture(); }
+        }
+
+        public static void SetPassThrough(bool on) { _passThroughLocal = on; }
+        public static bool PassThrough { get { return _passThroughLocal; } }
+
+        /// 转发后是否吞掉本机事件。归属未知时改为放行，
+        /// 避免「屏幕其实在本机、程序却把鼠标吞掉」导致完全动不了。
+        private static IntPtr Swallow(IntPtr hook, int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (_passThroughLocal) return CallNextHookEx(hook, nCode, wParam, lParam);
+            return (IntPtr)1;
         }
 
         public static Action<int, int> OnKey;
@@ -1717,6 +1730,9 @@ namespace KvmBridge
         /// Raw Input 模式下只影响本机指针可见位置，不再参与位移计算。
         private static void MaybeRecenter(int x, int y)
         {
+            // 归属未知、本机事件已放行时不能把指针拉回中心，否则用户
+            // 想把光标移到屏幕边缘会被不断拽回，看起来还是「不听使唤」。
+            if (_passThroughLocal) return;
             if (x < RecenterMargin || y < RecenterMargin
                 || x > _screenW - RecenterMargin
                 || y > _screenH - RecenterMargin)
@@ -1806,7 +1822,7 @@ namespace KvmBridge
                                     try { hk(vk == 0x31 ? 15 : 16); } catch { }
                                 }
                             }
-                            return (IntPtr)1;
+                            return Swallow(_kbHook, nCode, wParam, lParam);
                         }
 
                         if (_captureKeys)
@@ -1822,7 +1838,7 @@ namespace KvmBridge
                             {
                                 try { handler(vk, isDown ? 1 : 0); } catch { }
                             }
-                            return (IntPtr)1;
+                            return Swallow(_kbHook, nCode, wParam, lParam);
                         }
                     }
                 }
@@ -1871,7 +1887,7 @@ namespace KvmBridge
                         if (RawMouse.Live)
                         {
                             MaybeRecenter(x, y);
-                            return (IntPtr)1;
+                            return Swallow(_mouseHook, nCode, wParam, lParam);
                         }
 
                         int dx = x - _lastX;
@@ -1888,7 +1904,7 @@ namespace KvmBridge
                         if (Math.Abs(dx) > limitX || Math.Abs(dy) > limitY)
                         {
                             JumpsDropped++;
-                            return (IntPtr)1;
+                            return Swallow(_mouseHook, nCode, wParam, lParam);
                         }
 
                         if (dx != 0 || dy != 0)
@@ -1916,7 +1932,7 @@ namespace KvmBridge
                         // 每次移动都回中会在系统输入关键路径上多做一次光标定位，
                         // 高频鼠标下就是肉眼可见的卡顿。
                         MaybeRecenter(x, y);
-                        return (IntPtr)1;
+                        return Swallow(_mouseHook, nCode, wParam, lParam);
                     }
 
                     if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP
@@ -1933,7 +1949,7 @@ namespace KvmBridge
 
                         Action<int, int> handler = OnButton;
                         if (handler != null) { try { handler(button, down ? 1 : 0); } catch { } }
-                        return (IntPtr)1;
+                        return Swallow(_mouseHook, nCode, wParam, lParam);
                     }
 
                     if (msg == WM_MOUSEWHEEL)
@@ -1946,7 +1962,7 @@ namespace KvmBridge
                             int ticks = delta / 120;
                             if (ticks != 0) { try { handler(ticks); } catch { } }
                         }
-                        return (IntPtr)1;
+                        return Swallow(_mouseHook, nCode, wParam, lParam);
                     }
                 }
             }
@@ -1978,6 +1994,8 @@ namespace KvmBridge
         public event Action<bool> ScreenOnMe;
         /// 屏幕归属确定后触发，参数是输入源的 VCP 值（15/16/17/18）
         public event Action<int> OwnerChanged;
+        /// 切换失败且状态未知时触发：归属不再可信，两端应释放本地键鼠
+        public event Action OwnerUnknown;
 
         public SwitchFlow(RelayClient relay)
         {
@@ -2236,6 +2254,13 @@ namespace KvmBridge
                 _epoch++;
             }
             Status = note;
+            // 切换失败且状态未知时，交由托盘层清归属并广播「未知」，
+            // 让两端都释放本地键鼠，避免「有画面却鼠标不动」。
+            if (!success && (note.IndexOf("未知") >= 0 || note.IndexOf("无法确认") >= 0))
+            {
+                Action u = OwnerUnknown;
+                if (u != null) { try { u(); } catch { } }
+            }
             // 成功且信号已确认 → 隐藏；失败、未确认、无法确认 → 保留提示。
             StatusVisible = !success
                 || note.IndexOf("未确认") >= 0
@@ -2401,7 +2426,7 @@ namespace KvmBridge
         private const uint ES_SYSTEM_REQUIRED = 0x00000001;
         private const uint ES_DISPLAY_REQUIRED = 0x00000002;
 
-        private const string AppVersion = "0.5.6";
+        private const string AppVersion = "0.5.7";
 
         private static int[] Values { get { return Ddc.PortValues; } }
         private static string[] Names { get { return Ddc.PortNames; } }
@@ -2603,6 +2628,14 @@ namespace KvmBridge
             _flow.Updated += OnFlowUpdated;
             _flow.ScreenOnMe += OnScreenOnMe;
             _flow.OwnerChanged += OnOwnerFromFlow;
+            _flow.OwnerUnknown += delegate
+            {
+                _ownerKnown = false;
+                _ownerValue = -1;
+                ClearUse();
+                _relay.Send("OWNER -");
+                UpdateCapture(_cachedInput);
+            };
             InputHook.OnHotkey = delegate(int target) { _flow.Request(target); };
 
             _relay.Start();
@@ -2754,15 +2787,26 @@ namespace KvmBridge
 
             if (line.StartsWith("OWNER "))
             {
-                int v;
-                if (int.TryParse(line.Substring(6).Trim(), NumberStyles.Integer,
-                                 CultureInfo.InvariantCulture, out v))
+                string raw = line.Substring(6).Trim();
+                if (raw == "-")
                 {
-                    _ownerKnown = true;
-                    _ownerValue = v;
-                    // 屏幕切到本机：默认生效的是本机键鼠
-                    if (v == SwitchFlow.MyValue && _sharedMode)
-                        ApplyUse("Windows", "Windows", true);
+                    // 归属未确认：两端一律释放本地键鼠，绝不吞掉本机输入。
+                    _ownerKnown = false;
+                    _ownerValue = -1;
+                    ClearUse();
+                }
+                else
+                {
+                    int v;
+                    if (int.TryParse(raw, NumberStyles.Integer,
+                                     CultureInfo.InvariantCulture, out v))
+                    {
+                        _ownerKnown = true;
+                        _ownerValue = v;
+                        // 屏幕切到本机：默认生效的是本机键鼠
+                        if (v == SwitchFlow.MyValue && _sharedMode)
+                            ApplyUse("Windows", "Windows", true);
+                    }
                 }
                 UpdateCapture(_cachedInput);
                 return;
@@ -2933,6 +2977,7 @@ namespace KvmBridge
         {
             if (!_sharedMode || !_relay.Connected || !_relay.PeerCanInject)
             {
+                InputHook.SetPassThrough(false);
                 InputHook.SetCapture(false, false);
                 return;
             }
@@ -2947,13 +2992,22 @@ namespace KvmBridge
 
             if (screen == 15)
             {
-                // 键盘与鼠标分开控制，便于逐项排查
+                // 转发到对端，但本机事件一律放行：用户可能在任一台机器前，
+                // 把本机鼠标吞掉会直接表现为「鼠标完全不动」。
+                InputHook.SetPassThrough(true);
+                InputHook.SetCapture(_shareKeyboard, _shareMouse);
+            }
+            else if (screen == -1)
+            {
+                // 归属未知：仍转发以保留共享，但把本机事件放行。
+                // 这样无论屏幕实际在哪一台，本机键鼠都一定能动。
+                InputHook.SetPassThrough(true);
                 InputHook.SetCapture(_shareKeyboard, _shareMouse);
             }
             else
             {
-                // 屏幕不在 Mac，或者压根不知道在哪 → 一律不截获。
-                // 截获的风险是「本机键鼠被吞掉」，代价远大于少一个功能。
+                // 屏幕在本机，或在无法代切的第三方输入上：不截获。
+                InputHook.SetPassThrough(false);
                 InputHook.SetCapture(false, false);
             }
         }
@@ -3176,6 +3230,7 @@ namespace KvmBridge
                     + " owner=" + _ownerValue
                     + " capK=" + (InputHook.CaptureKeys ? 1 : 0)
                     + " capM=" + (InputHook.CaptureMouse ? 1 : 0)
+                    + " pass=" + (InputHook.PassThrough ? 1 : 0)
                     + " hooks=" + (InputHook.HooksOk ? 1 : 0)
                     + " ddc=" + _cachedInput
                     + " raw60=" + Ddc.LastRaw

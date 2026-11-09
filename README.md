@@ -2,7 +2,9 @@
 
 让一台显示器和一套键鼠在 **macOS** 与 **Windows** 两台主机之间共用。两端程序完全对等，任意一端都能切换屏幕、切换键鼠模式。
 
-当前版本：**0.5.6**
+当前版本：**0.5.7**
+
+0.5.7 修复：共享模式下**本机键鼠不再被吞掉**。此前「屏幕归属对端」时两端钩子会把本机键鼠事件整段消费掉；一旦切屏失败或用户用显示器按键手动切源，程序归属与实际画面不一致，就会表现为「有画面但鼠标完全不动」。现在转发与本机放行同时进行（两端对等），归属未知时通过 `OWNER -` 广播给对端、两端一并释放；Windows 状态新增 `pass=` 便于核对。
 
 0.5.6 调整：共享鼠标速度上调一档（硬件位移 × 屏幕比例 × 1.3），偏好写入 Windows 端 `speed.txt`、重启保留；切屏窗口内冻结显示器句柄枚举，避免 DDC 读失败触发 `EnumDisplayMonitors` 扰动 HPD 而弹「无信号」；确认阶段 DDC 读间隔由 500ms 放宽到 800ms，切屏入口不再做「唤醒 + 1.2s 等待」；状态文件新增 `raw60=` 原始 VCP 读数。
 
@@ -20,6 +22,7 @@
 | 键鼠共享 | 独立模式 / 共享模式，共享模式下可分别开关键盘与鼠标 | 依赖局域网 |
 | 当前设备显示 | 共享模式下「键盘」「鼠标」后实时标注当前生效的设备（macOS / Windows），两端同步 | 依赖局域网 |
 | 本地优先 | 两端同时操作时，本地键鼠优先，避免互相抢输入 | — |
+| 本机键鼠可用 | 共享转发的同时本机键鼠仍生效，切屏失败或手动切源也不会「鼠标不动」 | — |
 | 开机自启动 | 菜单中勾选控制，Mac 用系统登录项，Windows 用计划任务 + 看门狗 | — |
 | 热键 | `Ctrl+Alt+1` 切到 Mac、`Ctrl+Alt+2` 切到 Windows（Mac 上是 `⌃⌥1` / `⌃⌥2`） | — |
 
@@ -41,9 +44,9 @@
 
 | 文件 | 平台 | 说明 |
 |---|---|---|
-| `KVMBridge-0.5.6-mac.dmg` | macOS（Apple Silicon） | 拖入「应用程序」 |
-| `KVMBridge-0.5.6-mac.zip` | macOS（Apple Silicon） | 同上，zip 版 |
-| `KVMBridge-0.5.6-win.zip` | Windows 10 / 11 | 解压后直接运行 `KVMBridge.exe` |
+| `KVMBridge-0.5.7-mac.dmg` | macOS（Apple Silicon） | 拖入「应用程序」 |
+| `KVMBridge-0.5.7-mac.zip` | macOS（Apple Silicon） | 同上，zip 版 |
+| `KVMBridge-0.5.7-win.zip` | Windows 10 / 11 | 解压后直接运行 `KVMBridge.exe` |
 
 ### macOS 端
 1. 把 `KVMBridge.app` 拖进「应用程序」并运行，菜单栏出现图标。
@@ -108,7 +111,7 @@ windows/package/       Windows 端 C# 源码
                        （托盘、DDC、协议、钩子、自动发现、计划任务自启）
 vendor/m1ddc/          DDC/CI 命令行工具（源码 + 预编译 arm64 二进制）
 scripts/pack.sh        双端安装包打包脚本
-dist/                 0.5.6 可运行安装包
+dist/                 0.5.7 可运行安装包
 DESIGN.md             系统设计
 UI-SPEC.md            界面规格
 ```
@@ -133,7 +136,7 @@ UI-SPEC.md            界面规格
 ## 校验和（SHA-256）
 
 ```
-0236f31bb497028df828ab4855b47816a2694bd7c06cd0b43e291d9f5eb508aa  KVMBridge-0.5.6-mac.dmg
-73930acd1e61a8ac2b225b0b94cca7e2e1a260796088ffc8223d1d7136bfd913  KVMBridge-0.5.6-mac.zip
-f1b10371442136c49f9a794b9cd211bcf2273790d700f22ec2bd2db4655644d8  KVMBridge-0.5.6-win.zip
+0a92963394b69f499c4dfe3efb8b9eeca73227bf2893325e7af2afe40b30f819  KVMBridge-0.5.7-mac.dmg
+540e4af6182c88f187cbc3a93c88a2f746e30cf636bd153d0ab82a107164d3c9  KVMBridge-0.5.7-mac.zip
+dac677eadd6e584cc9291f65702a406e15d8fb7b486f9fba5edb62cccb5e7f2a  KVMBridge-0.5.7-win.zip
 ```
